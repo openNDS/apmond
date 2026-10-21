@@ -36,6 +36,7 @@ AP data is kept, e.g. a USB stick. If it is not mounted (or not writable) apmond
 ```
 <log_mountpoint>/apmond/              # package top level directory
   apmond_data/<mac12>                 # latest report from each AP (collector)
+  apmond_log.log                      # apmond log (apmond read_log [-f]), as mesh11sd_log.log
 
 /var/run/apmond/                      # volatile runtime state (/tmp/run/apmond on OpenWrt): role, ULA addresses, wifidetect, staging/, last_ts/
 ```

@@ -31,9 +31,14 @@ mkdir -p "$tmpdir" 2>/dev/null
 #############################################
 # Logging (same interface as mesh11sd)
 #############################################
+# Port of mesh11sd write_to_syslog (L1529-1585) / write_log (L1466-1524).
+# - messages below debuglevel are dropped; identical consecutive messages are dropped
+# - before the log location is known ($log_mountpoint empty): syslog only
+# - emerg/crit/err/notice: syslog AND the apmond log file; warn/info/debug: log file only
 write_to_syslog() {
 
-	if [ -z "$syslogmessage" ]; then
+	if [ -z "$syslogmessage" ] || [ "$syslogmessage" = "$last_syslogmessage" ]; then
+		syslogmessage=""
 		return 0
 	fi
 
@@ -41,26 +46,104 @@ write_to_syslog() {
 		debuglevel=1
 	fi
 
+	entrynum=$((${entrynum:-0} + 1))
+
 	case $debugtype in
-		"emerg") debugnum=0; priority="emerg";;
-		"err") debugnum=0; priority="err";;
-		"notice") debugnum=1; priority="notice";;
-		"warn") debugnum=1; priority="warn";;
-		"info") debugnum=2; priority="info";;
-		"debug") debugnum=3; priority="debug";;
-		*) debugnum=1; priority="notice";;
+		"emerg") debugnum=0; log_to_stderr="-s";;
+		"crit") debugnum=0; log_to_stderr="-s";;	# apmond addition (default passphrase warning)
+		"err") debugnum=0; log_to_stderr="-s";;
+		"notice") debugnum=1; log_to_stderr="";;
+		"warn") debugnum=1; log_to_stderr="-s";;
+		"info") debugnum=2; log_to_stderr="";;
+		"debug") debugnum=3; log_to_stderr="";;
+		*) debugnum=1; debugtype="notice"; log_to_stderr="";;
 	esac
 
-	if [ "$debugnum" -le "$debuglevel" ]; then
-		logger -t apmond -p "daemon.$priority" "$syslogmessage" 2>/dev/null
+	if [ "$debuglevel" -ge "$debugnum" ]; then
+		logmessage="[$entrynum] $syslogmessage"
+
+		if [ -z "$log_mountpoint" ]; then
+			logger -p "daemon.$debugtype" $log_to_stderr -t "apmond[$$]" "$logmessage" 2>/dev/null
+		else
+			case "$debugtype" in
+				emerg|crit|err|notice) logger -p "daemon.$debugtype" $log_to_stderr -t "apmond[$$]" "$logmessage" 2>/dev/null;;
+			esac
+
+			write_log
+		fi
+
+		last_syslogmessage="$syslogmessage"
 	fi
 
 	syslogmessage=""
+	return 0
+}
+
+write_log() {
+	# Log file: <log_mountpoint>/apmond/apmond_log.log (mesh11sd: $log_mountpoint/mesh11sd/mesh11sd_log.log)
+	local available log_entries
+
+	if [ -n "$log_disabled_reason" ]; then
+		# mesh11sd logs this for every message; apmond once per invocation
+		if [ "$log_disabled_logged" != "1" ]; then
+			log_disabled_logged=1
+			logger -p daemon.err -s -t "apmond[$$]" "$log_disabled_reason" 2>/dev/null
+		fi
+		return 1
+	fi
+
+	mkdir -p "$datadir" 2>/dev/null
+
+	# Truncate the log file to max_log_entries lines
+	log_entries=0
+	[ -f "$logfile" ] && log_entries=$(wc -l < "$logfile")
+	is_uint "$log_entries" || log_entries=0
+
+	if [ "$log_entries" -gt "$max_log_entries" ]; then
+		mv "$logfile" "$logfile.cut" 2>/dev/null
+		tail -n "$max_log_entries" "$logfile.cut" 2>/dev/null >> "$logfile"
+		rm -f "$logfile.cut"
+	fi
+
+	# Free space (KB) on the filesystem holding the log; mesh11sd requires more than 10
+	available=$(df "$datadir" 2>/dev/null | awk 'NR > 1 {v = $(NF-2)} END {print v}')
+	is_uint "$available" || available=0
+
+	if [ "$available" -gt "$min_free_kb" ]; then
+		datetime="$(date) "
+
+		if [ ! -f "$logfile" ]; then
+			echo "$datetime""New log file created" > "$logfile"
+		fi
+
+		echo "$datetime""daemon.$debugtype apmond[$$]: $logmessage" >> "$logfile"
+	else
+		logger -p daemon.err -s -t "apmond[$$]" "Log file too big, please archive contents and reduce max_log_entries" 2>/dev/null
+	fi
+}
+
+read_log() {
+	# mesh11sd read_log [ -f ] (L10562-10577)
+	if [ ! -e "$logfile" ]; then
+		exit 1
+	fi
+
+	if [ -z "$1" ]; then
+		cat "$logfile"
+	elif [ "$1" = "-F" ] || [ "$1" = "-f" ]; then
+		cat "$logfile"
+		rm "$logfile"
+		touch "$logfile"
+		tail -F "$logfile" 2>/dev/null
+	fi
+
+	exit 0
 }
 
 log_error() { syslogmessage="$1"; debugtype="err"; write_to_syslog; }
 log_warning() { syslogmessage="$1"; debugtype="warn"; write_to_syslog; }
 log_notice() { syslogmessage="$1"; debugtype="notice"; write_to_syslog; }
+log_crit() { syslogmessage="$1"; debugtype="crit"; write_to_syslog; }
 log_info() { syslogmessage="$1"; debugtype="info"; write_to_syslog; }
 log_debug() { syslogmessage="$1"; debugtype="debug"; write_to_syslog; }
 
@@ -137,35 +220,50 @@ load_config() {
 resolve_datadir() {
 	# Mirrors mesh11sd log_mountpoint (mesh11sd L211-229): default /tmp; if the mountpoint is not
 	# listed by df it falls back to /tmp. Resolved on EVERY invocation (daemon, CGI, CLI) so all use the same path.
-	log_mountpoint=$(get_option setup log_mountpoint /tmp)
-	log_mountpoint="${log_mountpoint%/}"
-	[ -z "$log_mountpoint" ] && log_mountpoint="/tmp"
+	max_log_entries=$(get_option setup max_log_entries 500)
+	is_uint "$max_log_entries" || max_log_entries=500
+	min_free_kb="${APMOND_TEST_MIN_FREE_KB:-10}"
+	local configured_mountpoint
+	configured_mountpoint=$(get_option setup log_mountpoint /tmp)
+	log_mountpoint=""	# logging is syslog only until the location is resolved
+	configured_mountpoint="${configured_mountpoint%/}"
+	[ -z "$configured_mountpoint" ] && configured_mountpoint="/tmp"
+	lmp="$configured_mountpoint"
 	datadir_reason=""
 
-	if [ "$log_mountpoint" != "/tmp" ]; then
-		# mesh11sd: mountcheck=$(df | grep -w "$log_mountpoint"). apmond matches the "Mounted on" column exactly,
+	if [ "$lmp" != "/tmp" ]; then
+		# mesh11sd: mountcheck=$(df | grep -w "$lmp"). apmond matches the "Mounted on" column exactly,
 		# so e.g. /mnt does not match a line for /mnt/usb
-		mountcheck=$(df 2>/dev/null | awk -v mp="$log_mountpoint" '$NF == mp {print $NF}')
+		mountcheck=$(df 2>/dev/null | awk -v mp="$lmp" '$NF == mp {print $NF}')
 
 		if [ -z "$mountcheck" ]; then
-			datadir_reason="log_mountpoint [ $log_mountpoint ] is not mounted - falling back to /tmp"
-			log_mountpoint="/tmp"
-		elif ! mkdir -p "$log_mountpoint/apmond" 2>/dev/null || ! touch "$log_mountpoint/apmond/.wtest" 2>/dev/null; then
+			datadir_reason="log_mountpoint [ $lmp ] is not mounted - falling back to /tmp"
+			lmp="/tmp"
+		elif ! mkdir -p "$lmp/apmond" 2>/dev/null || ! touch "$lmp/apmond/.wtest" 2>/dev/null; then
 			# apmond addition: mesh11sd does not test writability
 			datadir_reason="log_mountpoint [ $mountcheck ] is not writable - falling back to /tmp"
-			log_mountpoint="/tmp"
+			lmp="/tmp"
 		else
-			rm -f "$log_mountpoint/apmond/.wtest"
+			rm -f "$lmp/apmond/.wtest"
 		fi
 	fi
 
-	if [ "$log_mountpoint" = "/tmp" ]; then
+	# mesh11sd keeps the empty mountcheck after falling back, so file logging stays disabled (write_log L1521-1523)
+	log_disabled_reason=""
+	case "$datadir_reason" in
+		*"not mounted"*) log_disabled_reason="Log location is NOT a mountpoint - logs would fill storage space - logging disabled";;
+	esac
+
+	if [ "$lmp" = "/tmp" ]; then
+		# /tmp is always tmpfs on OpenWrt, so mesh11sd's df check always passes for it
 		datadir="${APMOND_TMP_DATADIR:-/tmp/apmond}"	# test override for the default location
 	else
-		datadir="$log_mountpoint/apmond"
+		datadir="$lmp/apmond"
 	fi
 
 	mkdir -p "$datadir/apmond_data" "$tmpdir/staging" "$tmpdir/last_ts" 2>/dev/null
+	logfile="$datadir/apmond_log.log"
+	log_mountpoint="$lmp"
 }
 
 log_datadir() {
@@ -1940,6 +2038,10 @@ show_help() {
 	Show the usage data received from access points (on the router / collector)
 	With no argument, list the access points that have sent data
 
+  option: read_log [ -f ]
+	Displays the apmond log
+	If -f is specified, the existing log will be deleted and all subsequent logs will be followed on the display
+
   option: send
 	Collect and send access point data to the collector ([<ula>::1]) once
 
@@ -2056,6 +2158,7 @@ show_status() {
 	fi
 
 	echo "storage: log_mountpoint=$log_mountpoint, AP data in $datadir/apmond_data"
+	echo "log:     $logfile$([ -n "$log_disabled_reason" ] && echo " (DISABLED: $log_disabled_reason)")"
 	echo "runtime: $tmpdir (volatile: role, ULA address list, staging, last_ts)"
 	[ -n "$datadir_reason" ] && echo "         WARNING: $datadir_reason"
 	echo "access points with data on this node: $(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)"
@@ -2068,7 +2171,7 @@ warn_default_seed() {
 		"*** WARNING *** apmond is using the DEFAULT built-in passphrase (apmon_seed). THIS IS INSECURE." \
 		"*** WARNING *** Anyone who knows the default passphrase can READ and INJECT access point data on this network." \
 		"*** WARNING *** Set the same private passphrase on EVERY node: uci set apmond.setup.apmon_seed='<your passphrase>'; uci commit apmond; service apmond restart (or edit option apmon_seed in /etc/config/apmond)"; do
-		logger -t apmond -p daemon.crit "$msg" 2>/dev/null
+		log_crit "$msg"
 	done
 }
 
@@ -2120,6 +2223,7 @@ case "$1" in
 	status) show_status;;
 	show_ap_data) show_ap_data "$2";;
 	send) send_ap_data; exit $?;;
+	read_log) read_log "$2";;
 	detect) get_router_state; manage_ula; echo "$role";;
 	cleanup) cleanup_ula;;
 	daemon) run_daemon;;

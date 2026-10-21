@@ -86,9 +86,10 @@ N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/run-N" APM
 echo "apmond.setup.startup_delay='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.claim_delay_max='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.device='apmbr1'" >> "$W/uci-N/apmond"
 echo "apmond.setup.default_seed_warn_interval='1'" >> "$W/uci-N/apmond"; echo "apmond.setup.interval='10'" >> "$W/uci-N/apmond"
 MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-N MOCK_IP_DIR=$W/ip-N APMOND_TMPDIR=$W/run-N APMOND_TMP_DATADIR=$W/tmp-N busybox sh $REPO/src/apmond daemon" 2>/dev/null
-nw=$(grep -c "daemon.crit \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/log")
+nw=$(grep -c "daemon.crit .*\*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/log")
 [ "$nw" -ge 2 ] && ok "default seed: crit warning at daemon start and repeated periodically ($nw times in 14 s with a 1 s test interval)" || ko "default seed warnings ($nw)"
 grep -q "daemon.crit .*READ and INJECT" "$W/log" && grep -q "daemon.crit .*option apmon_seed in /etc/config/apmond" "$W/log" && ok "warning explains the risk and how to set option apmon_seed" || ko "warning text"
+[ "$(grep -c "daemon.crit apmond\[[0-9]*\]: \[[0-9]*\] \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/tmp-N/apmond_log.log")" -ge 2 ] && ok "default passphrase warning also written to the apmond log file" || ko "crit not in log file"
 grep -q "add fd" "$W/ip-N/log" 2>/dev/null && ok "default seed: daemon runs normally (ULA applied, report attempted)" || ko "default seed daemon did not run"
 N status | grep -q "seed=DEFAULT .*INSECURE" && ok "status shows the default passphrase is in use" || ko "status default"
 echo "apmond.setup.apmon_seed='--__'" >> "$W/uci-N/apmond"
@@ -270,6 +271,43 @@ before=$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")
 raw "apmond;half;$CMAC;begin;0;$TS;$H2;$(sign "$SECRET" "$CMAC" "$TS" "$H2")" "$D2" >/dev/null
 [ -f "$W/run-R/staging/$CID.data" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")" ] && ok "half-received report: staged in the run dir only, stored report untouched" || ko "half report"
 
+echo "== 5d. logging (mesh11sd write_to_syslog / write_log / read_log)"
+LF="$W/tmp-R/apmond_log.log"
+[ -f "$LF" ] && head -n 1 "$LF" | grep -q "New log file created" && ok "log file <log_mountpoint>/apmond/apmond_log.log created by the CGI, first line 'New log file created'" || ko "log file"
+grep -q "^.* daemon\.warn apmond\[[0-9]*\]: \[[0-9]*\] apmond - Bad signature" "$LF" && ok "line format: '<date> daemon.<level> apmond[pid]: [n] message'" || ko "log line format"
+! grep -q "Bad signature" "$W/log" && ok "warn level messages go to the log file only, not syslog" || ko "warn reached syslog"
+grep -q "role change" "$LF" && grep -q "daemon.notice.*role change" "$W/log" && ok "notice (router role changes) go to syslog AND the log file" || ko "notice split"
+R status | grep -q "log:     $LF" && ok "status shows the log path" || ko "status log path"
+[ "$(R read_log | busybox md5sum)" = "$(busybox md5sum < "$LF")" ] && ok "read_log prints the log file (CLI resolves the same path as the CGI)" || ko "read_log"
+MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/run-O0" APMOND_TMP_DATADIR="$W/empty-O0" busybox sh "$REPO/src/apmond" read_log; [ $? -eq 1 ] && ok "read_log with no log file exits 1" || ko "read_log no file"
+cp "$LF" "$W/lf.bak"
+busybox timeout 3 busybox sh -c "MOCK_UCI_DIR=$W/uci-R MOCK_IP_DIR=$W/ip-R APMOND_TMPDIR=$W/run-R APMOND_TMP_DATADIR=$W/tmp-R busybox sh $REPO/src/apmond read_log -f" > "$W/follow.out" 2>/dev/null & FPID=$!
+sleep 1; raw "apmond;x;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null; sleep 1; wait $FPID
+grep -q "New log file created" "$W/follow.out" && grep -q "Stale timestamp\|Bad signature" "$W/follow.out" && [ "$(grep -c "New log file created" "$LF")" -le 1 ] && ! grep -q "Bad signature from \[ evil" "$LF" && ok "read_log -f prints, deletes the old log and follows new entries" || ko "read_log -f"
+# Same path for daemon, CGI and CLI on a custom mount, and the free space check
+mkdir -p "$W/small"; PATH="$SPATH" $SUDO mount -t tmpfs -o "size=96k,uid=$(id -u),gid=$(id -g)" apmsmall "$W/small"
+cp "$W/uci-R/apmond" "$W/r2.bak"; echo "apmond.setup.log_mountpoint='$W/small'" >> "$W/uci-R/apmond"
+raw "apmond;evil2;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null
+R status | grep -q "log:     $W/small/apmond/apmond_log.log" && grep -q "evil2\|Stale\|signature" "$W/small/apmond/apmond_log.log" && ok "custom mount: CGI and CLI use <log_mountpoint>/apmond/apmond_log.log" || ko "custom mount log"
+busybox dd if=/dev/zero of="$W/small/fill" bs=1k count=200 2>/dev/null
+avail=$(busybox df "$W/small" | awk 'NR>1 {print $(NF-2)}')
+: > "$W/log"; sz=$(wc -c < "$W/small/apmond/apmond_log.log")
+raw "apmond;evil3;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null
+grep -q "daemon.err.*Log file too big, please archive contents and reduce max_log_entries" "$W/log" && [ "$sz" -eq "$(wc -c < "$W/small/apmond/apmond_log.log")" ] && ok "free space ${avail} KB <= 10 KB: entry refused, 'Log file too big' to syslog" || ko "free space refusal (avail $avail)"
+PATH="$SPATH" $SUDO umount "$W/small"
+# Not a mountpoint: data falls back to /tmp, file logging disabled (as mesh11sd)
+sed -i "s#log_mountpoint=.*#log_mountpoint='$W/not-mounted'#" "$W/uci-R/apmond"
+: > "$W/log"; before=$(wc -l < "$LF")
+raw "apmond;evil4;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null
+[ "$(grep -c "daemon.err.*Log location is NOT a mountpoint - logs would fill storage space - logging disabled" "$W/log")" -eq 1 ] && [ "$before" -eq "$(wc -l < "$LF")" ] && ok "not a mountpoint: 'logging disabled' to syslog once, nothing written to the file" || ko "not a mountpoint"
+R status | grep -q "DISABLED: Log location is NOT a mountpoint" && ok "status shows logging disabled" || ko "status disabled"
+cp "$W/r2.bak" "$W/uci-R/apmond"
+# max_log_entries truncation
+echo "apmond.setup.max_log_entries='5'" >> "$W/uci-R/apmond"
+for i in 1 2 3 4 5 6 7 8; do raw "apmond;t$i;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null; done
+[ "$(wc -l < "$LF")" -le 6 ] && ok "max_log_entries: log truncated to the last N lines" || ko "truncation $(wc -l < "$LF")"
+cp "$W/r2.bak" "$W/uci-R/apmond"
+
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
 C status | grep -q "role=peer" && R status | grep -q "role=router" && ok "status shows role" || ko "status"
@@ -281,6 +319,7 @@ kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
 mountpoint -q "$W/usb" 2>/dev/null && $SUDO umount "$W/usb"
+mountpoint -q "$W/small" 2>/dev/null && $SUDO umount "$W/small"
 $SUDO ip link del apmdum0 2>/dev/null; $SUDO ip link del apmbr0 2>/dev/null; $SUDO ip link del apmbr1 2>/dev/null; $SUDO ip link del apmbr2 2>/dev/null
 echo
 echo "Result: $pass passed, $fail failed (work dir $W)"
