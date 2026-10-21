@@ -36,6 +36,9 @@ define Package/apmond/description
   access point is kept.
   It is a standalone port of the apmond functionality of mesh11sd,
   for networks that do not use mesh11sd.
+  Every node runs the same configuration: the router is detected
+  automatically and becomes the collector over IPv6 ULA, derived from a
+  shared seed, as in mesh11sd.
   It is fully compatible with static UCI and LuCI configuration.
   A command line interface is provided.
 endef

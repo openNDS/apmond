@@ -84,34 +84,193 @@ is_uint() {
 }
 
 load_config() {
-	debuglevel=$(get_option common debuglevel 1)
-	apmon_verbose_debug_enable=$(get_option common verbose_debug 0)
+	# Every option is optional with a built-in default; apmon_seed should be set (see below).
+	debuglevel=$(get_option setup debuglevel 1)
+	apmon_verbose_debug_enable=$(get_option setup verbose_debug 0)
+	enabled=$(get_option setup enabled 1)
+	# As mesh11sd auto_mesh_id: if unset, a built-in default seed is used ("--__", the mesh11sd default),
+	# so apmond works out of the box - with a prominent warning (see warn_default_seed)
+	apmon_seed=$(get_option setup apmon_seed "")
+	default_seed="--__"
 
-	client_enabled=$(get_option client enabled 0)
-	server=$(get_option client server "")
-	port=$(get_option client port 443)
-	interval=$(get_option client interval 30)
-	startup_delay=$(get_option client startup_delay 60)
-	client_secret=$(get_option client secret "")
-	verify_tls=$(get_option client verify_tls 0)
-	id_device=$(get_option client device br-lan)
-	bridges=$(get_option client bridge br-lan)
-	timeout=$(get_option client timeout 10)
+	if [ -z "$apmon_seed" ] || [ "$apmon_seed" = "$default_seed" ]; then
+		apmon_seed="$default_seed"
+		default_seed_in_use=1
+	else
+		default_seed_in_use=0
+	fi
 
-	server_enabled=$(get_option server enabled 0)
-	server_secret=$(get_option server secret "")
-	max_age=$(get_option server max_age 120)
-	max_report_size=$(get_option server max_report_size 1048576)
+	default_seed_warn_interval=$(get_option setup default_seed_warn_interval 21600)
+	interval=$(get_option setup interval 30)
+	startup_delay=$(get_option setup startup_delay 60)
+	id_device=$(get_option setup device br-lan)
+	bridges=$(get_option setup bridge "$id_device")
+	# router_detect (as mesh11sd portal_detect): 1 = auto detect (default), 0 = force router/collector, 2 = force peer
+	router_detect=$(get_option setup router_detect 1)
+	max_age=$(get_option setup max_age 120)
+	max_report_size=$(get_option setup max_report_size 1048576)
+	timeout=10
+	port="${APMOND_TEST_PORT:-443}"
 
 	is_uint "$interval" || interval=30
 	[ "$interval" -lt 10 ] && interval=10
 	is_uint "$startup_delay" || startup_delay=60
-	is_uint "$port" || port=443
-	is_uint "$timeout" || timeout=10
 	is_uint "$max_age" || max_age=120
 	is_uint "$max_report_size" || max_report_size=1048576
 	is_uint "$debuglevel" || debuglevel=1
 	is_uint "$apmon_verbose_debug_enable" || apmon_verbose_debug_enable=0
+	is_uint "$router_detect" || router_detect=1
+	is_uint "$default_seed_warn_interval" || default_seed_warn_interval=21600
+
+	derive_ids
+}
+
+#############################################
+# Seed derivation (mirrors mesh11sd auto_mesh_id / set_ula_prefix)
+#############################################
+derive_ids() {
+	apmon_id=""
+	apmon_secret=""
+	ula_base=""
+	ula_subnet=""
+	ula_prefix=""
+	router_ula=""
+
+	if [ -z "$apmon_seed" ]; then
+		return 1
+	fi
+
+	# mesh11sd: auto_mesh_id=$(printf "$auto_mesh_id" | sha256sum | awk '{printf "%s", $1}' | tail -c55 | head -c30)
+	# apmond uses printf '%s' so a "%" or "\" in the seed is taken literally
+	seed_hash=$(printf '%s' "$apmon_seed" | sha256sum | awk '{printf "%s", $1}')
+	apmon_id=$(echo -n "$seed_hash" | tail -c55 | head -c30)
+
+	# Shared secret used to key report signatures: the full sha256 of the seed.
+	# (The ULA below only exposes 40 bits of apmon_id on the wire, not the secret.)
+	apmon_secret="$seed_hash"
+
+	# mesh11sd set_ula_prefix: ula_base="fd${id:9:2}:${id:11:4}:${id:15:4}", ula_prefix="$ula_base::/48"
+	first=${apmon_id:9:2}
+	second=${apmon_id:11:4}
+	third=${apmon_id:15:4}
+	ula_base="fd$first:$second:$third"
+	ula_prefix="$ula_base::/48"
+
+	# mesh11sd takes the subnet from the portal's factory MAC hash and peers learn it from RAs.
+	# apmond does not touch odhcpd/RA, so every node must be able to compute it: take it from the seed hash.
+	ula_subnet=${apmon_id:19:4}
+	router_ula="$ula_base:$ula_subnet::1"
+}
+
+eui64_iid() {
+	# mesh11sd manage_fallback_ula_route: EUI-64 from the bridge MAC (u/l bit NOT flipped)
+	local mac_no_colons="${1//:/}"
+	local eui64="${mac_no_colons:0:2}${mac_no_colons:2:2}${mac_no_colons:4:2}fffe${mac_no_colons:6:2}${mac_no_colons:8:2}${mac_no_colons:10:2}"
+	echo "${eui64:0:4}:${eui64:4:4}:${eui64:8:4}:${eui64:12:4}"
+}
+
+#############################################
+# Router (collector) detection - port of mesh11sd get_portal_state, portal_detect=1
+#############################################
+get_router_state() {
+	local up_zone default_ipv6_gw default_ipv4_gw
+
+	if [ "$router_detect" -eq 0 ]; then
+		detected_state="router"
+		is_router="forced"
+	elif [ "$router_detect" -eq 2 ]; then
+		detected_state="peer"
+		is_router=""
+	else
+		# Check if router - try to get the upstream default gateway(s)
+		up_zone=$(uci -q get network.wan.device 2>/dev/null | awk '{printf "%s", $1}')
+		[ -z "$up_zone" ] && up_zone=$(uci -q get network.wan.ifname 2>/dev/null | awk '{printf "%s", $1}')
+		default_ipv6_gw=""
+		default_ipv4_gw=""
+
+		if [ -n "$up_zone" ]; then
+
+			if [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UP")" -eq 1 ] || [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UNKNOWN")" -eq 1 ]; then
+				# Look for ipv4 and ipv6 gateways
+				default_ipv6_gw=$(ip -6 neigh | grep "$up_zone" | grep "router" | awk '{print $1}' | awk -F ":" '$1 != "fe80" {print $0}')
+				default_ipv4_gw=$(ip -4 neigh | grep "$up_zone" | awk 'NR==1 {printf "%s", $1}')
+			fi
+		fi
+
+		if [ -n "$default_ipv6_gw" ] || [ -n "$default_ipv4_gw" ]; then
+			is_router="detected"
+			detected_state="router"
+			log_debug "apmond - node has upstream gateway(s), zone [ $up_zone ], [ $default_ipv6_gw ], [ $default_ipv4_gw ]"
+		else
+			is_router=""
+			detected_state="peer"
+		fi
+	fi
+
+	echo "is_router=\"$is_router\"; detected_state=\"$detected_state\"" > "$tmpdir/is_router"
+}
+
+#############################################
+# Runtime ULA addresses (mesh11sd manage_fallback_ula_route) - ip only, never UCI
+#############################################
+ula_addr_add() {
+	# $1 address/len, $2 device
+	if ! ip -6 addr show dev "$2" 2>/dev/null | grep -q "$1"; then
+
+		if ip -6 addr add "$1" dev "$2" 2>/dev/null; then
+			log_notice "apmond - ULA address $1 added to $2"
+		else
+			log_error "apmond - failed to add ULA address $1 to $2"
+			return 1
+		fi
+	fi
+
+	grep -qx "$1 $2" "$tmpdir/ula_addrs" 2>/dev/null || echo "$1 $2" >> "$tmpdir/ula_addrs"
+}
+
+ula_addr_del() {
+	# $1 address/len, $2 device
+	if ip -6 addr show dev "$2" 2>/dev/null | grep -q "$1"; then
+		ip -6 addr del "$1" dev "$2" 2>/dev/null && log_notice "apmond - ULA address $1 deleted from $2"
+	fi
+
+	if [ -f "$tmpdir/ula_addrs" ]; then
+		grep -vx "$1 $2" "$tmpdir/ula_addrs" > "$tmpdir/ula_addrs.tmp"
+		mv "$tmpdir/ula_addrs.tmp" "$tmpdir/ula_addrs"
+	fi
+}
+
+manage_ula() {
+	[ -n "$ula_base" ] || return 1
+
+	if [ ! -d "/sys/class/net/$id_device" ]; then
+		log_warning "apmond - device [ $id_device ] not found, cannot assign ULA addresses"
+		return 1
+	fi
+
+	get_device_mac
+
+	# Part 1: router ::1 on the router only, removed if this node is no longer the router
+	if [ "$detected_state" = "router" ]; then
+		ula_addr_add "$router_ula/64" "$id_device"
+	else
+		ula_addr_del "$router_ula/64" "$id_device"
+	fi
+
+	# Part 2: deterministic per node ULA on all nodes (also creates the on-link /64 route)
+	node_ula="$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
+	ula_addr_add "$node_ula/64" "$id_device"
+}
+
+cleanup_ula() {
+	# Remove every address apmond added (recorded in $tmpdir/ula_addrs)
+	if [ -f "$tmpdir/ula_addrs" ]; then
+		while read addr dev; do
+			[ -n "$addr" ] || continue
+			ip -6 addr del "$addr" dev "$dev" 2>/dev/null && log_notice "apmond - ULA address $addr deleted from $dev"
+		done < "$tmpdir/ula_addrs"
+		rm -f "$tmpdir/ula_addrs"
+	fi
 }
 
 #############################################
@@ -1279,22 +1438,15 @@ usi_full() {
 # Transport - client role
 #############################################
 server_url() {
-	local host="$server"
-
-	case "$host" in
-		\[*\]) ;;              # already bracketed IPv6
-		*:*) host="[$host]";;  # bare IPv6 literal
-	esac
-
-	echo "${APMOND_TEST_SCHEME:-https}://$host:$port$cgi_path"
+	# The collector is always the router at <ula_base>:<ula_subnet>::1, as the mesh11sd portal
+	echo "${APMOND_TEST_SCHEME:-https}://[$router_ula]:$port$cgi_path"
 }
 
 send_request() {
 	# $1 user agent, $2 query string (hex chunk, may be empty)
 	local url="$apmon_url"
-	local nocert=""
+	local nocert="--no-check-certificate"
 
-	[ "$verify_tls" = "1" ] || nocert="--no-check-certificate"
 	[ -n "$2" ] && url="$url?$2"
 	[ -n "$APMOND_TEST_SCHEME" ] && nocert=""
 
@@ -1303,20 +1455,11 @@ send_request() {
 
 send_ap_data() {
 
-	if [ "$client_enabled" != "1" ]; then
-		log_debug "apmond - client role is disabled"
+	if [ "$enabled" != "1" ]; then
+		log_debug "apmond - disabled"
 		return 1
 	fi
 
-	if [ -z "$server" ]; then
-		log_error "apmond - no server configured (apmond.client.server)"
-		return 1
-	fi
-
-	if [ -z "$client_secret" ]; then
-		log_error "apmond - no shared secret configured (apmond.client.secret), refusing to send"
-		return 1
-	fi
 
 	get_device_mac
 	ap_macaddr="$device_mac"
@@ -1344,7 +1487,7 @@ send_ap_data() {
 	# Authentication: signature = sha256(secret|mac|timestamp|sha256(payload))
 	ts=$(date +%s)
 	payload_hash=$(sha256_str "$hexencoded")
-	signature=$(make_signature "$client_secret" "$ap_macaddr" "$ts" "$payload_hash")
+	signature=$(make_signature "$apmon_secret" "$ap_macaddr" "$ts" "$payload_hash")
 	apmon_url=$(server_url)
 
 	# If no data, send a spider (keeps the protocol the same as mesh11sd)
@@ -1412,7 +1555,7 @@ send_ap_data() {
 }
 
 #############################################
-# Receiver - server role (called from /www/cgi-bin/apmon.cgi)
+# Receiver - every node runs it, only the router is sent to (called from /www/cgi-bin/apmon.cgi)
 #############################################
 nack() {
 	log_warning "apmond - $1 - rejecting attempted apmond server access"
@@ -1424,15 +1567,11 @@ write_node_data() {
 	node_id="$1"
 	data_raw="$2"
 
-	if [ "$server_enabled" != "1" ]; then
-		nack "server role disabled"
+	if [ "$enabled" != "1" ]; then
+		nack "apmond disabled"
 		return 1
 	fi
 
-	if [ -z "$server_secret" ]; then
-		nack "no shared secret configured on server"
-		return 1
-	fi
 
 	if [ -z "$node_id" ]; then
 		nack "Empty node_id"
@@ -1485,7 +1624,7 @@ write_node_data() {
 	fi
 
 	# Verify the signature (checked on every request, so a bad secret is rejected before any data is buffered)
-	expected_sig=$(make_signature "$server_secret" "$node_mac_raw" "$node_ts" "$node_hash")
+	expected_sig=$(make_signature "$apmon_secret" "$node_mac_raw" "$node_ts" "$node_hash")
 
 	if [ "$expected_sig" != "$node_sig" ]; then
 		nack "Bad signature from [ $node_hostname ] id [ $node_mac ]"
@@ -1616,14 +1755,20 @@ show_help() {
 	Show the apmond configuration and runtime state
 
   option: show_ap_data [ap_mac_id | all]
-	Show the usage data received from access points (server role)
+	Show the usage data received from access points (on the router / collector)
 	With no argument, list the access points that have sent data
 
   option: send
-	Collect and send access point data to the server once (client role)
+	Collect and send access point data to the collector ([<ula>::1]) once
+
+  option: detect
+	Run router detection once and apply the runtime ULA addresses
+
+  option: cleanup
+	Remove the runtime ULA addresses added by apmond
 
   option: daemon
-	Run the client role daemon (normally started by procd)
+	Run the daemon (normally started by procd)
 
   option: write_node_data [user_agent] [query_string]
 	Used internally by /www/cgi-bin/apmon.cgi
@@ -1703,40 +1848,76 @@ show_ap_data() {
 show_status() {
 	echo "apmond version $version (protocol v$protocol_version)"
 	echo
-	echo "Client role:  enabled=$client_enabled server=${server:-<not set>} port=$port interval=${interval}s secret=$([ -n "$client_secret" ] && echo set || echo '<not set>')"
+	if [ "$default_seed_in_use" -eq 1 ]; then
+		echo "seed=DEFAULT  *** WARNING: the default built-in passphrase is in use - INSECURE, anyone knowing it can read/inject AP data."
+		echo "              Set option apmon_seed in /etc/config/apmond (the same on every node) ***"
+	else
+		echo "seed=custom"
+	fi
 
-	if [ "$client_enabled" = "1" ]; then
+	echo "enabled=$enabled interval=${interval}s router_detect=$router_detect"
+
+	if [ -n "$apmon_seed" ]; then
 		get_device_mac
-		echo "              device=$id_device ap_mac_id=$device_mac bridges=$bridges"
-
-		if [ -f "$tmpdir/last_send" ]; then
-			. "$tmpdir/last_send"
-			echo "              last send: $last_send, status=$last_status, retcode=$last_retcode, bytes=$last_bytes"
-		fi
+		[ -f "$tmpdir/is_router" ] && . "$tmpdir/is_router"
+		echo "apmon_id=$apmon_id ula_prefix=$ula_prefix ula_subnet=$ula_subnet"
+		echo "collector=[$router_ula] device=$id_device ap_mac_id=$device_mac bridges=$bridges"
+		echo "role=${detected_state:-unknown (daemon not run yet)}"
+		echo "node_ula=$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
 	fi
 
-	echo "Server role:  enabled=$server_enabled max_age=${max_age}s secret=$([ -n "$server_secret" ] && echo set || echo '<not set>')"
-
-	if [ "$server_enabled" = "1" ]; then
-		echo "              access points with data: $(ls "$tmpdir/ap/" 2>/dev/null | wc -l)"
+	if [ -f "$tmpdir/last_send" ]; then
+		. "$tmpdir/last_send"
+		echo "last send: $last_send, status=$last_status, retcode=$last_retcode, bytes=$last_bytes"
 	fi
+
+	echo "access points with data on this node: $(ls "$tmpdir/ap/" 2>/dev/null | wc -l)"
+}
+
+warn_default_seed() {
+	[ "$default_seed_in_use" -eq 1 ] || return 0
+	# Always logged, regardless of debuglevel
+	for msg in \
+		"*** WARNING *** apmond is using the DEFAULT built-in passphrase (apmon_seed). THIS IS INSECURE." \
+		"*** WARNING *** Anyone who knows the default passphrase can READ and INJECT access point data on this network." \
+		"*** WARNING *** Set the same private passphrase on EVERY node: uci set apmond.setup.apmon_seed='<your passphrase>'; uci commit apmond; service apmond restart (or edit option apmon_seed in /etc/config/apmond)"; do
+		logger -t apmond -p daemon.crit "$msg" 2>/dev/null
+	done
+}
+
+daemon_loop_once() {
+	get_router_state
+	manage_ula
+	send_ap_data
 }
 
 run_daemon() {
-	if [ "$client_enabled" != "1" ]; then
-		log_notice "apmond - client role is disabled, daemon not needed"
-		exit 0
+	if [ "$enabled" != "1" ]; then
+		log_notice "apmond - disabled (apmond.setup.enabled=0), idle"
+		while true; do sleep 3600 & wait $!; done
 	fi
 
-	log_notice "apmond $version daemon starting, server [ $server ], interval [ $interval ]s"
+
+	warn_default_seed
+	last_seed_warning=$(date +%s)
+	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
+	trap 'cleanup_ula; exit 0' INT TERM
 	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc"
 	outputfile="$tmpdir/wifidetect"
 	wifi_chipset_detect
-	sleep "$startup_delay"
+	get_router_state
+	manage_ula
+	sleep "$startup_delay" & wait $!
 
 	while true; do
-		send_ap_data
-		sleep "$interval"
+
+		if [ "$default_seed_in_use" -eq 1 ] && [ $(( $(date +%s) - last_seed_warning )) -ge "$default_seed_warn_interval" ]; then
+			warn_default_seed
+			last_seed_warning=$(date +%s)
+		fi
+
+		daemon_loop_once
+		sleep "$interval" & wait $!
 	done
 }
 
@@ -1751,6 +1932,8 @@ case "$1" in
 	status) show_status;;
 	show_ap_data) show_ap_data "$2";;
 	send) send_ap_data; exit $?;;
+	detect) get_router_state; manage_ula; echo "$detected_state";;
+	cleanup) cleanup_ula;;
 	daemon) run_daemon;;
 	write_node_data) write_node_data "$2" "$3"; exit $?;;
 	*) echo "Unknown option [ $1 ]"; show_help; exit 1;;

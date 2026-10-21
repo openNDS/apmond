@@ -1,0 +1,17 @@
+#!/bin/sh
+# Mock of the "ip" calls apmond uses for router detection and runtime ULA addresses.
+# State per simulated node in $MOCK_IP_DIR. Everything else is passed to busybox ip.
+# MOCK_WAN_UP=1 makes the mock wan device "wan-mock" UP with an IPv4 gateway neighbour.
+D="${MOCK_IP_DIR:?}"; mkdir -p "$D"
+case "$*" in
+	"-6 addr show dev "*) cat "$D/addr_$5" 2>/dev/null; exit 0;;
+	"-6 addr add "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null && exit 2
+		echo "    inet6 $4 scope global" >> "$D/addr_$6"; echo "add $4 $6" >> "$D/log"; exit 0;;
+	"-6 addr del "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null || exit 2
+		grep -v "inet6 $4 " "$D/addr_$6" > "$D/t"; mv "$D/t" "$D/addr_$6"; echo "del $4 $6" >> "$D/log"; exit 0;;
+	"link show wan-mock")
+		if [ "${MOCK_WAN_UP:-0}" = "1" ]; then echo "9: wan-mock: <BROADCAST,UP,LOWER_UP> mtu 1500 state UP"; else echo "9: wan-mock: <BROADCAST> mtu 1500 state DOWN"; fi; exit 0;;
+	"-6 neigh") exit 0;;
+	"-4 neigh") [ "${MOCK_WAN_UP:-0}" = "1" ] && echo "192.0.2.1 dev wan-mock lladdr 02:00:5e:00:00:01 REACHABLE"; exit 0;;
+esac
+exec busybox ip "$@"

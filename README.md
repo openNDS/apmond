@@ -4,34 +4,27 @@ ApmonD is an access point monitoring daemon for OpenWrt. It is a standalone port
 apmond functionality in [mesh11sd](https://github.com/openNDS/mesh11sd), for networks that
 do not use mesh11sd.
 
-Access points (client role) periodically collect wireless and wired client usage data and
-send it to a central collector (server role), which keeps the latest report from each AP.
+Every node (access points and the router) runs the same daemon with an identical
+`/etc/config/apmond`. As in mesh11sd, a shared IPv6 ULA prefix and the report signing secret
+are derived from one memorable passphrase (`apmon_seed`). The node with an upstream wan gateway
+detects itself as the router, takes `<ula_prefix>:<subnet>::1` at runtime and becomes the
+collector; every node sends its report there. Addresses are applied with `ip` at runtime and
+removed on stop. Nothing is ever written to UCI.
 
 ## Features
 
-* Fully compatible with static UCI / LuCI - apmond never writes configuration at runtime
+* Fully compatible with static UCI / LuCI - one section, `config apmond 'setup'`, never written at runtime
+* Works out of the box: every option is optional. Without `apmon_seed` a built-in default passphrase
+  is used, with a critical syslog warning at start and every 6 hours (set your own!)
 * Shared secret authentication (BusyBox `sha256sum` only, no openssl)
-* IPv4 and IPv6 collector addresses
-* Same hex-encoded chunked HTTPS transport as mesh11sd (protocol v1)
-* Conflicts with mesh11sd (`CONFLICTS:=mesh11sd` in the OpenWrt Makefile)
-
-## Roles
-
-| Role | Runs on | What it does |
-|---|---|---|
-| Client | Each access point | Collects AP and wired client stats, sends them to the collector |
-| Server | The collector | Receives signed reports via `/cgi-bin/apmon.cgi`, stores the latest per AP |
-
-Both roles may be enabled on the same node.
+* Same hex-encoded chunked HTTPS transport as mesh11sd (protocol v1, signed)
+* Conflicts with mesh11sd (`CONFLICTS:=mesh11sd`)
 
 ## Quick start
 
-1. Install the package on the collector and on every access point.
-2. Put the **same** shared secret in `/etc/config/apmond` on every node.
-3. On the collector: enable the server role.
-4. On each access point: enable the client role and set `option server` to the collector.
-5. `service apmond restart` on each node.
-6. On the collector: `apmond show_ap_data` / `apmond show_ap_data all`.
+1. Install the package on every node.
+2. On every node: `uci set apmond.setup.apmon_seed='my private passphrase'; uci commit apmond; service apmond restart`
+3. On the router: `apmond show_ap_data` / `apmond show_ap_data all`. `apmond status` on any node shows its role.
 
 See `linux_openwrt/apmond/files/etc/config/apmond` for every option.
 
