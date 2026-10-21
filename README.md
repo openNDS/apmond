@@ -55,4 +55,4 @@ tests/                                   # Mock end-to-end tests (host with busy
 
 ## License
 
-GPL-2.0-only. Copyright (C) BlueWave Projects and Services.
+Released under the GNU General Public License version 2 or any later version, as mesh11sd (see LICENSE; the OpenWrt package metadata says `PKG_LICENSE:=GPL-2.0-only`, as mesh11sd's does). Copyright (C) BlueWave Projects and Services.

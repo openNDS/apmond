@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apmond
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=Rob White <rob@blue-wave.net>
 PKG_LICENSE:=GPL-2.0-only
@@ -53,7 +53,7 @@ define Package/apmond/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/www/cgi-bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/src/apmond $(1)/usr/sbin
-	$(INSTALL_CONF) $(PKG_BUILD_DIR)/linux_openwrt/apmond/files/etc/config/apmond $(1)/etc/config/
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/linux_openwrt/apmond/files/etc/config/apmond $(1)/etc/config/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/linux_openwrt/apmond/files/etc/init.d/apmond $(1)/etc/init.d/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi $(1)/www/cgi-bin/
 endef
