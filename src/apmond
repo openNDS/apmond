@@ -191,6 +191,8 @@ load_config() {
 	interval=$(get_option setup interval 30)
 	startup_delay=$(get_option setup startup_delay 60)
 	id_device=$(get_option setup device br-lan)
+	# bridge is a uci list (list bridge 'br-lan'); uci get returns list values space separated,
+	# and a legacy single "option bridge" still works
 	bridges=$(get_option setup bridge "$id_device")
 	# router_detect (as mesh11sd portal_detect): 1 = auto detect (default), 0 = force router/collector, 2 = force peer
 	router_detect=$(get_option setup router_detect 1)

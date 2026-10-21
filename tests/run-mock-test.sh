@@ -201,6 +201,12 @@ json_ok < "$W/report.json" && ok "show_ap_data <mac> is valid JSON" || ko "show_
 grep -q '"OpenWrt@phy0-ap0"' "$W/report.json" && grep -q '"OpenWrt5@phy1-ap0"' "$W/report.json" && ok "AP ifnames resolved without ifname in wireless config" || ko "ifname resolution"
 grep -q -e '"Guest@' -e '"Off@' "$W/report.json" && ko "down/disabled ifaces included" || ok "down/disabled wifi-ifaces skipped"
 grep -q '"apmdum0@apmbr0"' "$W/report.json" && grep -q '02:aa:bb:cc:dd:01' "$W/report.json" && ok "wired client found on bridge without any mesh interface" || ko "wired client scan"
+cp "$W/uci-C/apmond" "$W/cb.bak"; echo "apmond.setup.bridge='apmbr2' 'apmbr0'" >> "$W/uci-C/apmond"
+C status | grep -q "bridges=apmbr2 apmbr0\$" && ok "list bridge: status shows both bridges" || ko "list bridge status"
+C send && R show_ap_data "$CID" | grep -q '"apmdum0@apmbr0"' && ok "list bridge: wired client still found on 2nd list bridge" || ko "list bridge wired scan"
+cp "$W/cb.bak" "$W/uci-C/apmond"; echo "apmond.setup.bridge='apmbr0'" >> "$W/uci-C/apmond"
+C status | grep -q "bridges=apmbr0\$" && ok "legacy single option bridge still works" || ko "legacy option bridge"
+cp "$W/cb.bak" "$W/uci-C/apmond"; C status | grep -q "bridges=apmbr0\$" && ok "bridge defaults to device" || ko "bridge default"
 R show_ap_data all > "$W/all.json"; json_ok < "$W/all.json" && [ "$(grep -c '"clients@' "$W/all.json")" -eq 2 ] && ok "show_ap_data all: valid JSON, 2 APs" || ko "show_ap_data all"
 C show_ap_data | grep -q "$CID" && ko "peer stored data" || ok "peer stores nothing (reports only go to the router)"
 
