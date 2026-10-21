@@ -1,0 +1,4 @@
+#!/bin/sh
+# Mock ubus: network.wireless status (note: section "guest" is down / has no ifname)
+[ "$1 $2 $3" = "call network.wireless status" ] || exit 1
+echo '{"radio0":{"up":true,"interfaces":[{"section":"default_radio0","ifname":"phy0-ap0","config":{"mode":"ap","ssid":"OpenWrt"}}]},"radio1":{"up":true,"interfaces":[{"section":"default_radio1","ifname":"phy1-ap0","config":{"mode":"ap","ssid":"OpenWrt5"}},{"section":"guest","config":{"mode":"ap"}}]}}'

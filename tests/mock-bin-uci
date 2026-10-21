@@ -1,0 +1,11 @@
+#!/bin/sh
+# Minimal read-only mock of uci: data in $MOCK_UCI_DIR/<config> in "uci show" format
+[ "$1" = "-q" ] && shift
+cmd="$1"; key="$2"; cfg="${key%%.*}"; f="$MOCK_UCI_DIR/$cfg"
+[ -f "$f" ] || exit 1
+case "$cmd" in
+	show) cat "$f";;
+	get) val=$(awk -v k="$key=" 'index($0,k)==1 {print substr($0,length(k)+1); f=1; exit} END {exit !f}' "$f") || exit 1
+	     echo "$val" | sed "s/' '/ /g; s/^'//; s/'$//";;
+	*) echo "mock uci: unsupported $cmd" >&2; exit 1;;
+esac

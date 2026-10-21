@@ -1,0 +1,40 @@
+# apmond configuration
+# apmond never writes to this file - it may be edited by hand, with uci or with LuCI.
+#
+# The SAME secret must be set on every access point (client) and on the collector (server).
+# Generate one with, for example:  head -c 32 /dev/urandom | sha256sum | cut -c1-64
+
+config apmond 'common'
+	# Syslog level: 0 = errors only, 1 = notices/warnings (default), 2 = info, 3 = debug
+	option debuglevel '1'
+	# Log user agents of every chunk (very verbose)
+	option verbose_debug '0'
+
+# Client role: runs on each access point and sends its data to the server
+config apmond 'client'
+	option enabled '0'
+	# Server address: IPv4, IPv6 (bare or [bracketed]) or hostname
+	option server ''
+	option port '443'
+	# Seconds between reports (minimum 10)
+	option interval '30'
+	# Seconds to wait after start before the first report
+	option startup_delay '60'
+	option secret ''
+	# 1 = verify the server TLS certificate (requires a valid certificate on the server)
+	option verify_tls '0'
+	# wget/uclient-fetch timeout in seconds
+	option timeout '10'
+	# Device whose MAC identifies this AP (falls back to the factory/label MAC)
+	option device 'br-lan'
+	# Bridge(s) to scan for wired clients, space separated
+	option bridge 'br-lan'
+
+# Server role: runs on the collector, receives reports via uhttpd at /cgi-bin/apmon.cgi
+config apmond 'server'
+	option enabled '0'
+	option secret ''
+	# Reject reports whose timestamp differs from the server clock by more than this (seconds)
+	option max_age '120'
+	# Maximum size of one hex encoded report (characters)
+	option max_report_size '1048576'
