@@ -10,7 +10,7 @@ NAME=apmond
 PROG=/usr/sbin/apmond
 
 start_service() {
-	mkdir -p /tmp/apmond/ap /tmp/apmond/staging /tmp/apmond/last_ts
+	mkdir -p /tmp/apmond
 
 	# Enabled unless enabled=0. Every node runs the same daemon (idle until apmon_seed is set); it decides at runtime whether it is the router (collector) or a peer
 	[ "$(uci -q get apmond.setup.enabled)" = "0" ] && return 0

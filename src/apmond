@@ -23,7 +23,9 @@ tmpdir="${APMOND_TMPDIR:-/tmp/apmond}"
 outputfile="$tmpdir/wifidetect"
 cgi_path="/cgi-bin/apmon.cgi"
 
-mkdir -p "$tmpdir/ap" "$tmpdir/staging" "$tmpdir/last_ts" 2>/dev/null
+# Runtime state (role, ULA addresses, wifidetect...) always lives in $tmpdir.
+# AP data (ap/, staging/, last_ts/) lives in $datadir, see resolve_datadir (log_mountpoint).
+mkdir -p "$tmpdir" 2>/dev/null
 
 #############################################
 # Logging (same interface as mesh11sd)
@@ -127,7 +129,49 @@ load_config() {
 	is_uint "$claim_delay_max" || claim_delay_max=10
 	is_uint "$default_seed_warn_interval" || default_seed_warn_interval=21600
 
+	resolve_datadir
 	derive_ids
+}
+
+resolve_datadir() {
+	# Mirrors mesh11sd log_mountpoint (mesh11sd L211-229): default /tmp; if the mountpoint is not
+	# listed by df it falls back to /tmp. Resolved on EVERY invocation (daemon, CGI, CLI) so all use the same path.
+	log_mountpoint=$(get_option setup log_mountpoint /tmp)
+	log_mountpoint="${log_mountpoint%/}"
+	[ -z "$log_mountpoint" ] && log_mountpoint="/tmp"
+	datadir_reason=""
+
+	if [ "$log_mountpoint" != "/tmp" ]; then
+		# mesh11sd: mountcheck=$(df | grep -w "$log_mountpoint"). apmond matches the "Mounted on" column exactly,
+		# so e.g. /mnt does not match a line for /mnt/usb
+		mountcheck=$(df 2>/dev/null | awk -v mp="$log_mountpoint" '$NF == mp {print $NF}')
+
+		if [ -z "$mountcheck" ]; then
+			datadir_reason="log_mountpoint [ $log_mountpoint ] is not mounted - falling back to /tmp"
+			log_mountpoint="/tmp"
+		elif ! mkdir -p "$log_mountpoint/apmond" 2>/dev/null || ! touch "$log_mountpoint/apmond/.wtest" 2>/dev/null; then
+			# apmond addition: mesh11sd does not test writability
+			datadir_reason="log_mountpoint [ $mountcheck ] is not writable - falling back to /tmp"
+			log_mountpoint="/tmp"
+		else
+			rm -f "$log_mountpoint/apmond/.wtest"
+		fi
+	fi
+
+	if [ "$log_mountpoint" = "/tmp" ]; then
+		datadir="$tmpdir"	# /tmp/apmond (or the APMOND_TMPDIR test override)
+	else
+		datadir="$log_mountpoint/apmond"
+	fi
+
+	datadir="${APMOND_DATADIR:-$datadir}"
+	mkdir -p "$datadir/apmond_data" "$datadir/staging" "$datadir/last_ts" 2>/dev/null
+}
+
+log_datadir() {
+	# Logged by the daemon at start (as mesh11sd logs "option log_mountpoint [ ... ]")
+	[ -n "$datadir_reason" ] && log_warning "apmond - $datadir_reason"
+	log_info "apmond - option log_mountpoint [ $log_mountpoint ], AP data stored in [ $datadir/apmond_data ]"
 }
 
 #############################################
@@ -1781,7 +1825,7 @@ write_node_data() {
 
 	# Reject replays: the timestamp must be newer than the last accepted report from this AP
 	last_ts=0
-	[ -f "$tmpdir/last_ts/$node_mac" ] && last_ts=$(cat "$tmpdir/last_ts/$node_mac")
+	[ -f "$datadir/last_ts/$node_mac" ] && last_ts=$(cat "$datadir/last_ts/$node_mac")
 	is_uint "$last_ts" || last_ts=0
 
 	if [ "$node_ts" -le "$last_ts" ]; then
@@ -1799,7 +1843,7 @@ write_node_data() {
 		return 1
 	fi
 
-	staging="$tmpdir/staging/$node_mac"
+	staging="$datadir/staging/$node_mac"
 	session="$node_ts;$node_hash"
 
 	case "$chunkstatus" in
@@ -1857,9 +1901,9 @@ write_node_data() {
 					echo -n " "
 					cat "$staging.data"
 					echo " $node_id"
-				} > "$tmpdir/ap/.$node_mac.tmp" && mv "$tmpdir/ap/.$node_mac.tmp" "$tmpdir/ap/$node_mac"
+				} > "$datadir/apmond_data/.$node_mac.tmp" && mv "$datadir/apmond_data/.$node_mac.tmp" "$datadir/apmond_data/$node_mac"
 
-				echo -n "$node_ts" > "$tmpdir/last_ts/$node_mac"
+				echo -n "$node_ts" > "$datadir/last_ts/$node_mac"
 				rm -f "$staging.session" "$staging.ua" "$staging.data"
 				log_info "apmond data received from node [$node_hostname] id [ $node_mac ]"
 				echo -n "*end"
@@ -1868,7 +1912,7 @@ write_node_data() {
 
 		spider)
 			# Authenticated keepalive with no client data - nothing to store
-			echo -n "$node_ts" > "$tmpdir/last_ts/$node_mac"
+			echo -n "$node_ts" > "$datadir/last_ts/$node_mac"
 			echo -n "*spider"
 		;;
 	esac
@@ -1914,7 +1958,7 @@ show_help() {
 }
 
 show_ap_data() {
-	data_nodes=$(ls "$tmpdir/ap/" 2>/dev/null | awk '{printf "%s ", $1}')
+	data_nodes=$(ls "$datadir/apmond_data/" 2>/dev/null | awk '{printf "%s ", $1}')
 
 	if [ "$1" = "all" ]; then
 
@@ -1925,7 +1969,7 @@ show_ap_data() {
 		all_first=1
 
 		for data_node in $data_nodes; do
-			hex_to_str "$(awk '{printf "%s", $2}'  "$tmpdir/ap/$data_node" 2>/dev/null)"
+			hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$data_node" 2>/dev/null)"
 
 			if [ ! -z "$str" ]; then
 				str=$(echo -n "$str" | tail -n +2 | head -n -2)
@@ -1973,7 +2017,7 @@ show_ap_data() {
 			exit 1
 		fi
 
-		hex_to_str "$(awk '{printf "%s", $2}'  "$tmpdir/ap/$node" 2>/dev/null)"
+		hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$node" 2>/dev/null)"
 
 		if [ ! -z "$str" ]; then
 			echo "$str"
@@ -2011,7 +2055,9 @@ show_status() {
 		echo "last send: $last_send, status=$last_status, retcode=$last_retcode, bytes=$last_bytes"
 	fi
 
-	echo "access points with data on this node: $(ls "$tmpdir/ap/" 2>/dev/null | wc -l)"
+	echo "storage: log_mountpoint=$log_mountpoint, AP data in $datadir/apmond_data"
+	[ -n "$datadir_reason" ] && echo "         WARNING: $datadir_reason"
+	echo "access points with data on this node: $(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)"
 }
 
 warn_default_seed() {
@@ -2039,6 +2085,7 @@ run_daemon() {
 
 
 	warn_default_seed
+	log_datadir
 	last_seed_warning=$(date +%s)
 	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
 	trap 'cleanup_ula; exit 0' INT TERM

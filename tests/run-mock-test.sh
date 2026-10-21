@@ -185,7 +185,7 @@ sleep 1
 raw() { busybox wget -q -O - -U "$1" "http://[$RULA]:$PORT/cgi-bin/apmon.cgi${2:+?$2}" 2>/dev/null; }
 C send && ok "peer C sent its report to [$RULA]" || ko "C send"
 R send && ok "router R sent its own report to itself" || ko "R send"
-n=$(ls "$W/tmp-R/ap" | wc -l)
+n=$(ls "$W/tmp-R/apmond_data" | wc -l)
 [ "$n" -eq 2 ] && ok "collector holds 2 APs" || ko "collector holds $n APs"
 CID=$(echo "$CMAC" | tr -d :)
 R show_ap_data "$CID" > "$W/report.json"
@@ -202,14 +202,14 @@ SECRET=$(printf '%s' "$SEED" | busybox sha256sum | cut -c1-64)
 DMAC="$CMAC"
 DATA=$(printf '{"x":1}' | busybox hexdump -v -e '1/1 "%02x"')
 H=$(printf '%s' "$DATA" | busybox sha256sum | cut -c1-64)
-before=$(busybox sha256sum < "$W/tmp-R/ap/$CID")
+before=$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")
 TS=$(date +%s); SIG=$(sign "wrong-secret" "$DMAC" "$TS" "$H")
 r=$(raw "apmond;evil;$DMAC;begin;0;$TS;$H;$SIG" "$DATA")
 case "$r" in nack*signature*) ok "wrong secret rejected";; *) ko "wrong secret: $r";; esac
 SIG=$(sign "$(printf '%s' 'another seed' | busybox sha256sum | cut -c1-64)" "$DMAC" "$TS" "$H")
 r=$(raw "apmond;evil;$DMAC;begin;0;$TS;$H;$SIG" "$DATA")
 case "$r" in nack*signature*) ok "secret derived from a different seed rejected";; *) ko "other seed: $r";; esac
-[ -z "$(ls "$W/tmp-R/staging/")" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/ap/$CID")" ] && ok "nothing buffered or stored" || ko "bad secret left data"
+[ -z "$(ls "$W/tmp-R/staging/")" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")" ] && ok "nothing buffered or stored" || ko "bad secret left data"
 TS=$(( $(date +%s) - 1000 )); SIG=$(sign "$SECRET" "$DMAC" "$TS" "$H")
 r=$(raw "apmond;stale;$DMAC;begin;0;$TS;$H;$SIG" "$DATA"); case "$r" in nack*Stale*) ok "stale timestamp rejected";; *) ko "stale: $r";; esac
 TS=$(( $(date +%s) + 1000 )); SIG=$(sign "$SECRET" "$DMAC" "$TS" "$H")
@@ -234,6 +234,28 @@ R show_ap_data "$CID" > "$W/big.json"
 n=$(grep -c '"02:00:00:00:' "$W/big.json")
 [ "$rc" -eq 0 ] && [ "$n" -eq 151 ] && json_ok < "$W/big.json" && ok "large report: $last_bytes hex chars in $(( (last_bytes + 2047) / 2048 )) chunks, 151 stations, valid JSON" || ko "large report rc=$rc stations=$n"
 
+echo "== 5b. storage location (log_mountpoint, as mesh11sd)"
+RID=$(cat /sys/class/net/apmbr1/address | tr -d :)
+R status | grep -q "storage: log_mountpoint=/tmp, AP data in $W/tmp-R/apmond_data" && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "default: log_mountpoint=/tmp, store in /tmp/apmond/apmond_data (test override $W/tmp-R)" || ko "default storage"
+mkdir -p "$W/usb"
+PATH="$SPATH" $SUDO mount -t tmpfs -o "size=4m,uid=$(id -u),gid=$(id -g)" apmtest "$W/usb"
+cp "$W/uci-R/apmond" "$W/r.bak"
+echo "apmond.setup.log_mountpoint='$W/usb'" >> "$W/uci-R/apmond"
+sleep 1
+C send; R send
+[ -f "$W/usb/apmond/apmond_data/$CID" ] && [ -f "$W/usb/apmond/apmond_data/$RID" ] && ok "custom mountpoint: CGI stores reports in <log_mountpoint>/apmond/apmond_data/<mac>" || ko "custom store"
+R status | grep -q "storage: log_mountpoint=$W/usb, AP data in $W/usb/apmond/apmond_data" && ok "status shows the custom storage path" || ko "custom status"
+R show_ap_data | grep -q "$CID" && R show_ap_data "$CID" | json_ok && ok "show_ap_data reads from the custom mountpoint" || ko "custom show"
+PATH="$SPATH" $SUDO mount -o remount,ro "$W/usb"
+R status | grep -q "WARNING: log_mountpoint \[ $W/usb \] is not writable - falling back to /tmp" && R status | grep -q "AP data in $W/tmp-R/apmond_data" && ok "mounted but read-only: falls back to /tmp with a warning" || ko "ro fallback"
+PATH="$SPATH" $SUDO umount "$W/usb"
+R status | grep -q "WARNING: log_mountpoint \[ $W/usb \] is not mounted - falling back to /tmp" && ok "media removed (not mounted): falls back to /tmp, as mesh11sd" || ko "unmounted fallback"
+sed -i "s#log_mountpoint=.*#log_mountpoint='$W/does-not-exist'#" "$W/uci-R/apmond"
+R status | grep -q "is not mounted - falling back to /tmp" && [ ! -d "$W/does-not-exist" ] && ok "missing mountpoint: falls back to /tmp, nothing created" || ko "missing fallback"
+sleep 1; C send && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "reports still stored after fallback" || ko "store after fallback"
+cp "$W/r.bak" "$W/uci-R/apmond"
+grep -q "^[[:space:]]*#option log_mountpoint '/tmp'" "$REPO/linux_openwrt/apmond/files/etc/config/apmond" && ok "shipped config has a commented log_mountpoint example" || ko "config example"
+
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
 C status | grep -q "role=peer" && R status | grep -q "role=router" && ok "status shows role" || ko "status"
@@ -244,6 +266,7 @@ R cleanup; C cleanup
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
+mountpoint -q "$W/usb" 2>/dev/null && $SUDO umount "$W/usb"
 $SUDO ip link del apmdum0 2>/dev/null; $SUDO ip link del apmbr0 2>/dev/null; $SUDO ip link del apmbr1 2>/dev/null; $SUDO ip link del apmbr2 2>/dev/null
 echo
 echo "Result: $pass passed, $fail failed (work dir $W)"
