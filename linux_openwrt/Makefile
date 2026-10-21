@@ -25,7 +25,11 @@ define Package/apmond
   TITLE:=Access Point Monitoring Daemon
   PKGARCH:=all
   DEPENDS:=+luci-ssl
+  # opkg records CONFLICTS; OpenWrt's apk packaging ignores CONFLICTS, so express it as an apk "!" dependency
   CONFLICTS:=mesh11sd
+  ifneq ($(CONFIG_USE_APK),)
+    EXTRA_DEPENDS:=!mesh11sd (>=0)
+  endif
   URL:=https://github.com/opennds/apmond
 endef
 
