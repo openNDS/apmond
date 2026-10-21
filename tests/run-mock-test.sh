@@ -65,7 +65,7 @@ echo "system.@system[0].hostname='ap1'" > "$W/uci-C/system"
 echo "apmond.setup.device='apmbr1'" >> "$W/uci-R/apmond"
 echo "apmond.setup.device='apmbr0'" >> "$W/uci-C/apmond"
 
-node() { n=$1; shift; MOCK_NODE=$n MOCK_UCI_DIR="$W/uci-$n" MOCK_IP_DIR="$W/ip-$n" APMOND_TMPDIR="$W/tmp-$n" APMOND_TEST_SCHEME=http APMOND_TEST_PORT=$PORT busybox sh "$REPO/src/apmond" "$@"; }
+node() { n=$1; shift; MOCK_NODE=$n MOCK_UCI_DIR="$W/uci-$n" MOCK_IP_DIR="$W/ip-$n" APMOND_TMPDIR="$W/run-$n" APMOND_TMP_DATADIR="$W/tmp-$n" APMOND_TEST_SCHEME=http APMOND_TEST_PORT=$PORT busybox sh "$REPO/src/apmond" "$@"; }
 R() { MOCK_WAN_UP=${WAN:-1} node R "$@"; }
 C() { MOCK_WAN_UP=0 node C "$@"; }
 S() { MOCK_WAN_UP=1 node S "$@"; }
@@ -81,11 +81,11 @@ CF="$REPO/linux_openwrt/apmond/files/etc/config/apmond"
 [ -z "$(grep -o 'get_option [a-z_]*' "$REPO/src/apmond" | grep -v 'get_option setup' | grep -v 'get_option()')" ] && ! grep -q "apmond\.\(client\|server\|common\)" "$REPO/src/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ok "code reads only apmond.setup.<option>" || ko "non setup options read"
 [ "$(grep -c '^[[:space:]]*option' "$CF")" -eq 0 ] && grep -q "^[[:space:]]*#option apmon_seed" "$CF" && ok "shipped config: every option (incl. apmon_seed) commented out" || ko "shipped config"
 mkdir -p "$W/uci-N"; echo "apmond.setup=apmond" > "$W/uci-N/apmond"; echo "network.wan.device='wan-mock'" > "$W/uci-N/network"
-N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/tmp-N" busybox sh "$REPO/src/apmond" "$@"; }
+N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/run-N" APMOND_TMP_DATADIR="$W/tmp-N" busybox sh "$REPO/src/apmond" "$@"; }
 : > "$W/log"
 echo "apmond.setup.startup_delay='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.claim_delay_max='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.device='apmbr1'" >> "$W/uci-N/apmond"
 echo "apmond.setup.default_seed_warn_interval='1'" >> "$W/uci-N/apmond"; echo "apmond.setup.interval='10'" >> "$W/uci-N/apmond"
-MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-N MOCK_IP_DIR=$W/ip-N APMOND_TMPDIR=$W/tmp-N busybox sh $REPO/src/apmond daemon" 2>/dev/null
+MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-N MOCK_IP_DIR=$W/ip-N APMOND_TMPDIR=$W/run-N APMOND_TMP_DATADIR=$W/tmp-N busybox sh $REPO/src/apmond daemon" 2>/dev/null
 nw=$(grep -c "daemon.crit \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/log")
 [ "$nw" -ge 2 ] && ok "default seed: crit warning at daemon start and repeated periodically ($nw times in 14 s with a 1 s test interval)" || ko "default seed warnings ($nw)"
 grep -q "daemon.crit .*READ and INJECT" "$W/log" && grep -q "daemon.crit .*option apmon_seed in /etc/config/apmond" "$W/log" && ok "warning explains the risk and how to set option apmon_seed" || ko "warning text"
@@ -97,7 +97,7 @@ N status | grep -q "seed=DEFAULT" && ok "seed explicitly set to the default is t
 N status | grep -q "seed=custom" && ok "custom seed: status shows custom" || ko "custom status"
 N cleanup
 R0=$(printf '%s' '--__' | busybox sha256sum | awk '{printf "%s", $1}' | tail -c55 | head -c30)
-[ "$R0" = "$(MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/tmp-O0" busybox sh "$REPO/src/apmond" status | awk '{for(i=1;i<=NF;i++) if (index($i,"apmon_id=")==1) print substr($i,10)}')" ] && ok "default seed is the mesh11sd auto_mesh_id default \"--__\"" || ko "default seed value"
+[ "$R0" = "$(MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/run-O0" APMOND_TMP_DATADIR="$W/tmp-O0" busybox sh "$REPO/src/apmond" status | awk '{for(i=1;i<=NF;i++) if (index($i,"apmon_id=")==1) print substr($i,10)}')" ] && ok "default seed is the mesh11sd auto_mesh_id default \"--__\"" || ko "default seed value"
 
 echo "== 1. derivation from apmon_seed (mirrors mesh11sd auto_mesh_id / set_ula_prefix)"
 REF=$("$PY" - "$SEED" <<'EOP'
@@ -116,7 +116,7 @@ KEY=apmon_id; a=$(st R); KEY=ula_prefix; p=$(st R); KEY=ula_subnet; sn=$(st R); 
 [ "$col" = "[$4]" ] && ok "peer collector address = $col" || ko "collector $col != [$4]"
 RULA=$4
 sed "s/apmon_seed='.*'/apmon_seed='another seed'/" "$W/uci-C/apmond" > "$W/other"; mkdir -p "$W/uci-O"; cp "$W/other" "$W/uci-O/apmond"
-KEY=collector; o=$(MOCK_UCI_DIR="$W/uci-O" APMOND_TMPDIR="$W/tmp-O" busybox sh "$REPO/src/apmond" status | awk -F= '/collector=/ {print $2}' | cut -d' ' -f1)
+KEY=collector; o=$(MOCK_UCI_DIR="$W/uci-O" APMOND_TMPDIR="$W/run-O" APMOND_TMP_DATADIR="$W/tmp-O" busybox sh "$REPO/src/apmond" status | awk -F= '/collector=/ {print $2}' | cut -d' ' -f1)
 [ "$o" != "[$RULA]" ] && ok "a different seed gives a different collector ULA ($o)" || ko "other seed same ULA"
 
 echo "== 2. identical config on every node, role selected at runtime"
@@ -176,7 +176,7 @@ PATH="$SPATH" $SUDO ip -6 addr add "$RULA/128" dev lo 2>/dev/null
 sed "s#/usr/sbin/apmond#busybox sh $REPO/src/apmond#" "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" > "$W/www/cgi-bin/apmon.cgi.real"
 cat > "$W/www/cgi-bin/apmon.cgi" <<EOC
 #!/bin/sh
-export PATH="$PATH" MOCK_UCI_DIR="$W/uci-R" MOCK_IP_DIR="$W/ip-R" APMOND_TMPDIR="$W/tmp-R" MOCK_LOG="$W/log"
+export PATH="$PATH" MOCK_UCI_DIR="$W/uci-R" MOCK_IP_DIR="$W/ip-R" APMOND_TMPDIR="$W/run-R" APMOND_TMP_DATADIR="$W/tmp-R" MOCK_LOG="$W/log"
 . "$W/www/cgi-bin/apmon.cgi.real"
 EOC
 chmod 755 "$W/www/cgi-bin/apmon.cgi"
@@ -209,7 +209,7 @@ case "$r" in nack*signature*) ok "wrong secret rejected";; *) ko "wrong secret: 
 SIG=$(sign "$(printf '%s' 'another seed' | busybox sha256sum | cut -c1-64)" "$DMAC" "$TS" "$H")
 r=$(raw "apmond;evil;$DMAC;begin;0;$TS;$H;$SIG" "$DATA")
 case "$r" in nack*signature*) ok "secret derived from a different seed rejected";; *) ko "other seed: $r";; esac
-[ -z "$(ls "$W/tmp-R/staging/")" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")" ] && ok "nothing buffered or stored" || ko "bad secret left data"
+[ -z "$(ls "$W/run-R/staging/")" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")" ] && ok "nothing buffered or stored" || ko "bad secret left data"
 TS=$(( $(date +%s) - 1000 )); SIG=$(sign "$SECRET" "$DMAC" "$TS" "$H")
 r=$(raw "apmond;stale;$DMAC;begin;0;$TS;$H;$SIG" "$DATA"); case "$r" in nack*Stale*) ok "stale timestamp rejected";; *) ko "stale: $r";; esac
 TS=$(( $(date +%s) + 1000 )); SIG=$(sign "$SECRET" "$DMAC" "$TS" "$H")
@@ -229,7 +229,7 @@ r=$(raw "apmond;meshnode-1234;$DMAC;begin;0" "$DATA"); case "$r" in nack*) ok "u
 echo "== 5. large report, chunked"
 sleep 1
 MOCK_STATIONS=150 C send; rc=$?
-. "$W/tmp-C/last_send"
+. "$W/run-C/last_send"
 R show_ap_data "$CID" > "$W/big.json"
 n=$(grep -c '"02:00:00:00:' "$W/big.json")
 [ "$rc" -eq 0 ] && [ "$n" -eq 151 ] && json_ok < "$W/big.json" && ok "large report: $last_bytes hex chars in $(( (last_bytes + 2047) / 2048 )) chunks, 151 stations, valid JSON" || ko "large report rc=$rc stations=$n"
@@ -255,6 +255,20 @@ R status | grep -q "is not mounted - falling back to /tmp" && [ ! -d "$W/does-no
 sleep 1; C send && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "reports still stored after fallback" || ko "store after fallback"
 cp "$W/r.bak" "$W/uci-R/apmond"
 grep -q "^[[:space:]]*#option log_mountpoint '/tmp'" "$REPO/linux_openwrt/apmond/files/etc/config/apmond" && ok "shipped config has a commented log_mountpoint example" || ko "config example"
+
+echo "== 5c. runtime state in the volatile run directory"
+[ -f "$W/run-R/role" ] && [ -f "$W/run-R/ula_addrs" ] && [ -f "$W/run-C/last_send" ] && [ -d "$W/run-R/staging" ] && [ -d "$W/run-R/last_ts" ] && ok "role, ULA list, last_send, staging/, last_ts/ in the run dir" || ko "run dir contents"
+[ ! -e "$W/tmp-R/role" ] && [ ! -e "$W/tmp-R/staging" ] && [ ! -e "$W/tmp-R/last_ts" ] && [ ! -e "$W/tmp-R/ula_addrs" ] && ok "data dir holds only apmond_data/" || ko "state in data dir: $(ls "$W/tmp-R")"
+grep -q 'tmpdir="${APMOND_TMPDIR:-/var/run/apmond}"' "$REPO/src/apmond" && grep -q "mkdir -p /var/run/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ok "default run dir /var/run/apmond, created at start" || ko "run dir default"
+R status | grep -q "runtime: $W/run-R" && ok "status shows the run dir" || ko "status run dir"
+[ -z "$(ls -A "$W/tmp-R/apmond_data" | grep '^\.')" ] && ok "no temp or partial files left in apmond_data" || ko "temp files in apmond_data"
+grep -q '> "$datadir/apmond_data/.$node_mac.tmp" && mv "$datadir/apmond_data/.$node_mac.tmp" "$datadir/apmond_data/$node_mac"' "$REPO/src/apmond" && ok "verified report written to a temp file inside apmond_data, then renamed (atomic for readers)" || ko "atomic write"
+# A half-received report leaves nothing in apmond_data, only in the run dir staging
+. "$REPO/tests/sign.sh"; sleep 1
+TS=$(date +%s); D2=$(printf '{"half":1}' | busybox hexdump -v -e '1/1 "%02x"'); H2=$(printf '%s' "$D2" | busybox sha256sum | cut -c1-64)
+before=$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")
+raw "apmond;half;$CMAC;begin;0;$TS;$H2;$(sign "$SECRET" "$CMAC" "$TS" "$H2")" "$D2" >/dev/null
+[ -f "$W/run-R/staging/$CID.data" ] && [ "$before" = "$(busybox sha256sum < "$W/tmp-R/apmond_data/$CID")" ] && ok "half-received report: staged in the run dir only, stored report untouched" || ko "half report"
 
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
