@@ -26,7 +26,7 @@ JF=$(command -v jsonfilter || command -v jsonpath || true)
 [ -n "$JF" ] && ln -sf "$JF" "$W/mock/jsonfilter"
 
 # Two real bridges give two distinct node MACs; apmbr0 also gets a wired client
-for b in apmbr0 apmbr1 apmbr2; do $SUDO ip link add $b type bridge 2>/dev/null; $SUDO ip link set $b up; done
+n=0; for b in apmbr0 apmbr1 apmbr2; do $SUDO ip link add $b type bridge 2>/dev/null; $SUDO ip link set $b address 02:00:00:0a:00:0$n; $SUDO ip link set $b up; n=$((n+1)); done  # MACs with zero bytes exercise canonical IPv6 forms
 $SUDO ip link add apmdum0 type veth peer name apmdum1 2>/dev/null
 $SUDO ip link set apmdum0 master apmbr0; $SUDO ip link set apmdum0 up; $SUDO ip link set apmdum1 up
 $SUDO bridge fdb add 02:aa:bb:cc:dd:01 dev apmdum0 master static 2>/dev/null
@@ -82,6 +82,9 @@ CF="$REPO/linux_openwrt/apmond/files/etc/config/apmond"
 [ "$(grep -c '^[[:space:]]*option' "$CF")" -eq 0 ] && ok "shipped config: every option commented out" || ko "shipped config has active options"
 ! grep -q "option apmon_seed" "$CF" && ! grep -qi "apmon_seed[[:space:]]*['\"]" "$CF" && ! grep -q "apmon_seed=" "$CF" && ok "shipped config contains no passphrase (no apmon_seed value, active or commented)" || ko "shipped config contains a passphrase"
 grep -q "DEFAULT passphrase" "$CF" && grep -q "add an apmon_seed option" "$CF" && ok "shipped config explains the default passphrase and how to set apmon_seed" || ko "config seed comment"
+sed -n '/^ipv6_canon() {/,/^}/p' "$REPO/src/apmond" > "$W/canon.sh"
+cv=$(busybox sh -c ". $W/canon.sh; ipv6_canon fd46:cfe5:34c5:6ddd:5254:00ff:fe12:3401/64; ipv6_canon fd46:0cfe:0000:6ddd::1/64; ipv6_canon fd46:0:0:1:0:0:0:1; ipv6_canon fd46:1:0:0:5254:0:0:1" | tr '\n' ' ')
+[ "$cv" = "fd46:cfe5:34c5:6ddd:5254:ff:fe12:3401/64 fd46:cfe:0:6ddd::1/64 fd46:0:0:1::1 fd46:1::5254:0:0:1 " ] && ok "ipv6_canon gives the kernel (RFC 5952) form" || ko "ipv6_canon: $cv"
 grep -q "INSTALL_DATA.*etc/config/apmond" "$REPO/linux_openwrt/Makefile" && ! grep -q "INSTALL_CONF" "$REPO/linux_openwrt/Makefile" && ok "Makefile installs /etc/config/apmond 0644 (INSTALL_DATA)" || ko "config install mode"
 mkdir -p "$W/uci-N"; echo "apmond.setup=apmond" > "$W/uci-N/apmond"; echo "network.wan.device='wan-mock'" > "$W/uci-N/network"
 N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/run-N" APMOND_TMP_DATADIR="$W/tmp-N" busybox sh "$REPO/src/apmond" "$@"; }
@@ -105,11 +108,11 @@ R0=$(printf '%s' '--__' | busybox sha256sum | awk '{printf "%s", $1}' | tail -c5
 
 echo "== 1. derivation from apmon_seed (mirrors mesh11sd auto_mesh_id / set_ula_prefix)"
 REF=$("$PY" - "$SEED" <<'EOP'
-import hashlib,sys
+import hashlib,sys,ipaddress
 h=hashlib.sha256(sys.argv[1].encode()).hexdigest()
 i=h[-55:][:30]                      # tail -c55 | head -c30
 base="fd%s:%s:%s"%(i[9:11],i[11:15],i[15:19])
-print(i, base+"::/48", i[19:23], base+":"+i[19:23]+"::1")
+print(i, base+"::/48", i[19:23], ipaddress.IPv6Address(base+":"+i[19:23]+"::1").compressed)   # kernel (RFC 5952) form
 EOP
 )
 set -- $REF
@@ -132,7 +135,8 @@ r=$(R detect); c=$(C detect)
 grep -q "inet6 $RULA/64 " "$W/ip-R/addr_apmbr1" && ok "router took $RULA/64 at runtime (ip -6 addr add)" || ko "router ::1"
 grep -q "::1/64" "$W/ip-C/addr_apmbr0" 2>/dev/null && ko "peer took ::1" || ok "peer did not take ::1"
 CMAC=$(cat /sys/class/net/apmbr0/address); CIID=$(echo "$CMAC" | tr -d : | sed 's/^\(.\{6\}\)\(.\{6\}\)$/\1fffe\2/; s/\(....\)/\1:/g; s/:$//')
-grep -q "inet6 ${RULA%::1}:$CIID/64 " "$W/ip-C/addr_apmbr0" && ok "peer took its EUI-64 node ULA ${RULA%::1}:$CIID" || ko "peer node ULA"
+CNULA=$("$PY" -c "import ipaddress,sys; print(ipaddress.IPv6Address(sys.argv[1]).compressed)" "${RULA%::1}:$CIID")
+grep -q "inet6 $CNULA/64 " "$W/ip-C/addr_apmbr0" && ok "peer took its EUI-64 node ULA $CNULA" || ko "peer node ULA $CNULA"
 cat "$W/uci-C/apmond" > "$W/c.bak"; echo "apmond.setup.router_detect='0'" >> "$W/uci-C/apmond"
 [ "$(C detect)" = "backed-off" ] && ok "router_detect=0 forces router candidate (backs off: R already holds ::1)" || ko "force router"
 cp "$W/c.bak" "$W/uci-C/apmond"; [ "$(C detect)" = "peer" ] && ! grep -q "$RULA/64" "$W/ip-C/addr_apmbr0" && ok "back to auto: peer again and ::1 removed" || ko "demote C"
@@ -317,6 +321,7 @@ C status | grep -q "role=peer" && R status | grep -q "role=router" && ok "status
 R show_ap_data | grep -q "$CID" && ok "show_ap_data list" || ko "list"
 R cleanup; C cleanup
 [ -z "$(grep inet6 "$W/ip-R/addr_apmbr1" "$W/ip-C/addr_apmbr0" 2>/dev/null)" ] && ok "cleanup removed every runtime ULA address" || ko "cleanup"
+! grep -h "failed to add ULA" "$W"/*log* "$W"/*/apmond/apmond_log.log 2>/dev/null | grep -q . && ok "no 'failed to add ULA address' errors when re-checking addresses (kernel prints canonical form)" || ko "ULA re-add errors: $(grep -rh "failed to add ULA" "$W" 2>/dev/null | head -2)"
 
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"

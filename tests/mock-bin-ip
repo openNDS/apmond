@@ -6,6 +6,8 @@
 # Everything else is passed to busybox ip.
 D="${MOCK_IP_DIR:?}"; N="${MOCK_NET:-$D/../net}"; me="${MOCK_NODE:-node}"; mkdir -p "$D" "$N"
 key() { echo "$1" | tr ':/' '__'; }
+# Like the kernel, print addresses without leading zeros in a group (e.g. 00ff -> ff)
+case "$1 $2 $3" in "-6 addr add"|"-6 addr del") op=$3; a=$(echo "$4" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g'); shift 4; set -- -6 addr "$op" "$a" "$@";; esac
 case "$*" in
 	"-6 addr show dev "*) cat "$D/addr_$5" 2>/dev/null; exit 0;;
 	"-6 addr add "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null && exit 2

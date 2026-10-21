@@ -21,11 +21,14 @@ PROG=/usr/sbin/apmond
 start_service() {
 	mkdir -p /var/run/apmond
 
-	# Enabled unless enabled=0. Every node runs the same daemon (idle until apmon_seed is set); it decides at runtime whether it is the router (collector) or a peer
+	# Enabled unless enabled=0. Every node runs the same daemon; it decides at runtime whether it is the router (collector) or a peer
 	[ "$(uci -q get apmond.setup.enabled)" = "0" ] && return 0
 
 	procd_open_instance
 	procd_set_param command "$PROG" daemon
+	# Restart the instance when /etc/config/apmond changes (service apmond reload / uci commit trigger);
+	# the daemon's TERM trap removes its runtime ULA addresses before the new instance claims them
+	procd_set_param file /etc/config/apmond
 	procd_set_param respawn
 	procd_set_param stdout 1
 	procd_set_param stderr 1

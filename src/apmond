@@ -307,7 +307,37 @@ derive_ids() {
 	# mesh11sd takes the subnet from the portal's factory MAC hash and peers learn it from RAs.
 	# apmond does not touch odhcpd/RA, so every node must be able to compute it: take it from the seed hash.
 	ula_subnet=${apmon_id:19:4}
-	router_ula="$ula_base:$ula_subnet::1"
+	router_ula=$(ipv6_canon "$ula_base:$ula_subnet::1")
+}
+
+ipv6_canon() {
+	# Print an IPv6 address (optional /len) in the canonical RFC 5952 form the kernel and ip print:
+	# lower case, no leading zeros in a group, the longest run (2+) of zero groups as "::".
+	# Needed so addresses we generate (e.g. "...:5254:00ff:fe12:3401") match "ip -6 addr show" output.
+	echo "$1" | awk '{
+		addr = tolower($0); len = ""
+		if (index(addr, "/")) { len = substr(addr, index(addr, "/")); addr = substr(addr, 1, index(addr, "/") - 1) }
+		# expand to 8 groups
+		dc = index(addr, "::")
+		if (dc) { left = substr(addr, 1, dc - 1); right = substr(addr, dc + 2) } else { left = addr; right = "" }
+		nl = (left == "") ? 0 : split(left, L, ":"); nr = (right == "") ? 0 : split(right, R, ":")
+		out = 0
+		for (i = 1; i <= nl; i++) h[++out] = L[i]
+		if (dc) for (i = 0; i < 8 - nl - nr; i++) h[++out] = "0"
+		for (i = 1; i <= nr; i++) h[++out] = R[i]
+		for (i = 1; i <= 8; i++) { x = h[i]; sub(/^0+/, "", x); if (x == "") x = "0"; h[i] = x }
+		bs = 0; bl = 0; cs = 0; cl = 0
+		for (i = 1; i <= 8; i++) {
+			if (h[i] == "0") { if (cl == 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } } else cl = 0
+		}
+		r = ""
+		for (i = 1; i <= 8; i++) {
+			if (bl >= 2 && i == bs) { r = r "::"; i = bs + bl - 1; continue }
+			if (r != "" && substr(r, length(r)) != ":") r = r ":"
+			r = r h[i]
+		}
+		print r len
+	}'
 }
 
 eui64_iid() {
@@ -363,7 +393,7 @@ get_router_state() {
 #############################################
 ula_addr_add() {
 	# $1 address/len, $2 device
-	if ! ip -6 addr show dev "$2" 2>/dev/null | grep -q "$1"; then
+	if ! ip -6 addr show dev "$2" 2>/dev/null | grep -q "inet6 $1 "; then
 
 		if ip -6 addr add "$1" dev "$2" 2>/dev/null; then
 			log_notice "apmond - ULA address $1 added to $2"
@@ -378,7 +408,7 @@ ula_addr_add() {
 
 ula_addr_del() {
 	# $1 address/len, $2 device
-	if ip -6 addr show dev "$2" 2>/dev/null | grep -q "$1"; then
+	if ip -6 addr show dev "$2" 2>/dev/null | grep -q "inet6 $1 "; then
 		ip -6 addr del "$1" dev "$2" 2>/dev/null && log_notice "apmond - ULA address $1 deleted from $2"
 	fi
 
@@ -402,7 +432,7 @@ manage_ula() {
 	claim_router_ula
 
 	# Part 2: deterministic per node ULA on all nodes (also creates the on-link /64 route)
-	node_ula="$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
+	node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")
 	ula_addr_add "$node_ula/64" "$id_device"
 }
 
@@ -2150,7 +2180,7 @@ show_status() {
 		echo "collector=[$router_ula] device=$id_device ap_mac_id=$device_mac bridges=$bridges"
 		echo "role=${role:-unknown (daemon not run yet)}"
 		[ -n "$role_reason" ] && echo "role_reason: $role_reason"
-		echo "node_ula=$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
+		echo "node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")"
 	fi
 
 	if [ -f "$tmpdir/last_send" ]; then
