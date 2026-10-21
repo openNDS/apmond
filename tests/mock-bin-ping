@@ -1,0 +1,8 @@
+#!/bin/sh
+# Mock ping: an address "answers" if another simulated node holds it in the $MOCK_NET registry.
+# MOCK_PING_BLOCK=1 simulates the holder being unreachable (e.g. to force a DAD race).
+for a in "$@"; do addr="$a"; done
+[ "${MOCK_PING_BLOCK:-0}" = "1" ] && exit 1
+k=$(echo "$addr/64" | tr ':/' '__'); N="${MOCK_NET:?}"
+[ -f "$N/$k" ] && [ "$(cat "$N/$k")" != "${MOCK_NODE:-node}" ] && exit 0
+exit 1

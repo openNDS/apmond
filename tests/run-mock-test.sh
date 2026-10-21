@@ -21,24 +21,25 @@ SUDO="sudo -n"
 if ! $SUDO true 2>/dev/null; then echo "this test needs sudo (bridges, lo address)"; exit 1; fi
 mkdir -p "$W/bb" "$W/mock" "$W/www/cgi-bin" "$W/uci-R" "$W/uci-C"
 for a in busybox $(busybox --list); do ln -sf "$BB" "$W/bb/$a"; done
-for m in uci iw ubus logger ip; do cp "$REPO/tests/mock-bin-$m" "$W/mock/$m"; done
+for m in uci iw ubus logger ip ping; do cp "$REPO/tests/mock-bin-$m" "$W/mock/$m"; done
 JF=$(command -v jsonfilter || command -v jsonpath || true)
 [ -n "$JF" ] && ln -sf "$JF" "$W/mock/jsonfilter"
 
 # Two real bridges give two distinct node MACs; apmbr0 also gets a wired client
-for b in apmbr0 apmbr1; do $SUDO ip link add $b type bridge 2>/dev/null; $SUDO ip link set $b up; done
+for b in apmbr0 apmbr1 apmbr2; do $SUDO ip link add $b type bridge 2>/dev/null; $SUDO ip link set $b up; done
 $SUDO ip link add apmdum0 type veth peer name apmdum1 2>/dev/null
 $SUDO ip link set apmdum0 master apmbr0; $SUDO ip link set apmdum0 up; $SUDO ip link set apmdum1 up
 $SUDO bridge fdb add 02:aa:bb:cc:dd:01 dev apmdum0 master static 2>/dev/null
 SPATH="$PATH"
 export PATH="$W/mock:$W/bb"
-export MOCK_LOG="$W/log"
+export MOCK_LOG="$W/log" MOCK_NET="$W/net"
 
 SEED="correct horse battery staple $(date +%s)"
 for n in R C; do
 	cat > "$W/uci-$n/apmond" <<EOC
 apmond.setup=apmond
 apmond.setup.apmon_seed='$SEED'
+apmond.setup.claim_delay_max='1'
 EOC
 	cat > "$W/uci-$n/wireless" <<'EOC'
 wireless.radio0=wifi-device
@@ -64,9 +65,10 @@ echo "system.@system[0].hostname='ap1'" > "$W/uci-C/system"
 echo "apmond.setup.device='apmbr1'" >> "$W/uci-R/apmond"
 echo "apmond.setup.device='apmbr0'" >> "$W/uci-C/apmond"
 
-node() { n=$1; shift; MOCK_UCI_DIR="$W/uci-$n" MOCK_IP_DIR="$W/ip-$n" APMOND_TMPDIR="$W/tmp-$n" APMOND_TEST_SCHEME=http APMOND_TEST_PORT=$PORT busybox sh "$REPO/src/apmond" "$@"; }
+node() { n=$1; shift; MOCK_NODE=$n MOCK_UCI_DIR="$W/uci-$n" MOCK_IP_DIR="$W/ip-$n" APMOND_TMPDIR="$W/tmp-$n" APMOND_TEST_SCHEME=http APMOND_TEST_PORT=$PORT busybox sh "$REPO/src/apmond" "$@"; }
 R() { MOCK_WAN_UP=${WAN:-1} node R "$@"; }
 C() { MOCK_WAN_UP=0 node C "$@"; }
+S() { MOCK_WAN_UP=1 node S "$@"; }
 st() { "$@" status | awk -v k="$KEY=" '{for (i=1;i<=NF;i++) if (index($i,k)==1) print substr($i,length(k)+1)}'; }
 json_ok() { "$PY" -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; }
 
@@ -81,7 +83,7 @@ CF="$REPO/linux_openwrt/apmond/files/etc/config/apmond"
 mkdir -p "$W/uci-N"; echo "apmond.setup=apmond" > "$W/uci-N/apmond"; echo "network.wan.device='wan-mock'" > "$W/uci-N/network"
 N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/tmp-N" busybox sh "$REPO/src/apmond" "$@"; }
 : > "$W/log"
-echo "apmond.setup.startup_delay='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.device='apmbr1'" >> "$W/uci-N/apmond"
+echo "apmond.setup.startup_delay='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.claim_delay_max='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.device='apmbr1'" >> "$W/uci-N/apmond"
 echo "apmond.setup.default_seed_warn_interval='1'" >> "$W/uci-N/apmond"; echo "apmond.setup.interval='10'" >> "$W/uci-N/apmond"
 MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-N MOCK_IP_DIR=$W/ip-N APMOND_TMPDIR=$W/tmp-N busybox sh $REPO/src/apmond daemon" 2>/dev/null
 nw=$(grep -c "daemon.crit \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/log")
@@ -128,13 +130,44 @@ grep -q "::1/64" "$W/ip-C/addr_apmbr0" 2>/dev/null && ko "peer took ::1" || ok "
 CMAC=$(cat /sys/class/net/apmbr0/address); CIID=$(echo "$CMAC" | tr -d : | sed 's/^\(.\{6\}\)\(.\{6\}\)$/\1fffe\2/; s/\(....\)/\1:/g; s/:$//')
 grep -q "inet6 ${RULA%::1}:$CIID/64 " "$W/ip-C/addr_apmbr0" && ok "peer took its EUI-64 node ULA ${RULA%::1}:$CIID" || ko "peer node ULA"
 cat "$W/uci-C/apmond" > "$W/c.bak"; echo "apmond.setup.router_detect='0'" >> "$W/uci-C/apmond"
-[ "$(C detect)" = "router" ] && ok "router_detect=0 forces router" || ko "force router"
+[ "$(C detect)" = "backed-off" ] && ok "router_detect=0 forces router candidate (backs off: R already holds ::1)" || ko "force router"
 cp "$W/c.bak" "$W/uci-C/apmond"; [ "$(C detect)" = "peer" ] && ! grep -q "$RULA/64" "$W/ip-C/addr_apmbr0" && ok "back to auto: peer again and ::1 removed" || ko "demote C"
 echo "apmond.setup.router_detect='2'" >> "$W/uci-R/apmond"
 [ "$(R detect)" = "peer" ] && ok "router_detect=2 forces peer" || ko "force peer"
 sed -i '/router_detect/d' "$W/uci-R/apmond"
 [ "$(WAN=0 R detect)" = "peer" ] && ! grep -q "$RULA/64" "$W/ip-R/addr_apmbr1" && ok "router losing its wan gateway drops ::1" || ko "R demote"
 [ "$(R detect)" = "router" ] || ko "R re-promote"
+
+echo "== 2b. two routers: first come wins, back off, failover, DAD failure"
+# S: a second node with an upstream gateway and the same config
+mkdir -p "$W/uci-S"; cp "$W/uci-R/"* "$W/uci-S/"; sed -i "s/device='apmbr1'/device='apmbr2'/" "$W/uci-S/apmond"
+echo "system.@system[0].hostname='router2'" > "$W/uci-S/system"
+r=$(S detect)
+[ "$r" = "backed-off" ] && ! grep -q "$RULA/64" "$W/ip-S/addr_apmbr2" && ok "second router S sees $RULA answering and backs off without claiming" || ko "S backoff: $r"
+S status | grep -q "role=backed-off" && S status | grep -q "role_reason: .*already in use" && ok "status shows role=backed-off and why" || ko "S status"
+grep -q "role change \[ none \] -> \[ backed-off \]" "$W/log" && ok "role change logged to syslog" || ko "role change log"
+# Failover: R goes away
+R cleanup
+r1=$(S detect); r2=$(S detect)
+[ "$r1" = "backed-off" ] && [ "$r2" = "backed-off" ] && S status | grep -q "not answering (2/3)" && ok "R gone: S waits (misses 1/3, 2/3)" || ko "S wait $r1 $r2"
+r3=$(S detect)
+[ "$r3" = "router" ] && grep -q "inet6 $RULA/64 " "$W/ip-S/addr_apmbr2" && ok "after 3 consecutive misses S re-runs detection and claims $RULA" || ko "S takeover $r3"
+grep -q "re-running router detection" "$W/log" && grep -q "role change \[ backed-off \] -> \[ router \]" "$W/log" && ok "takeover logged" || ko "takeover log"
+# R returns: first come wins, S keeps ::1
+r=$(R detect)
+[ "$r" = "backed-off" ] && grep -q "$RULA/64" "$W/ip-S/addr_apmbr2" && ok "R returns and backs off, S keeps $RULA" || ko "R return $r"
+# DAD failure on claim: R cannot ping S (race), claims, DAD fails, drops and backs off
+R cleanup
+r=$(MOCK_PING_BLOCK=1 R detect)
+[ "$r" = "backed-off" ] && ! grep -q "$RULA/64" "$W/ip-R/addr_apmbr1" && grep -q "add $RULA/64 apmbr1 dadfailed" "$W/ip-R/log" && ok "claim with DAD failure: address dropped, R backs off" || ko "DAD claim $r"
+R status | grep -q "role_reason: DAD failed" && ok "status reason: DAD failed" || ko "DAD status"
+# DAD failure after claiming (flag appears later on the holder)
+sed -i "s#inet6 $RULA/64 scope global\$#inet6 $RULA/64 scope global dadfailed#" "$W/ip-S/addr_apmbr2"
+r=$(S detect)
+[ "$r" = "backed-off" ] && ! grep -q "$RULA/64" "$W/ip-S/addr_apmbr2" && ok "DAD failed after claiming: S drops $RULA and backs off" || ko "late DAD $r"
+# Restore R as the collector for the end to end tests
+S cleanup; R cleanup
+[ "$(R detect)" = "router" ] && ok "R claims again once $RULA is free" || ko "R reclaim"
 for f in R C; do ls "$W/uci-$f" | grep -qv -e apmond -e wireless -e network -e system && ko "unexpected uci file"; done
 grep -E '^[[:space:]]*(echo .*\| *)?uci( -q)? +(set|commit|batch|add|add_list|del|delete|del_list|rename|revert)' "$REPO/src/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ko "uci write in src/apmond" || ok "no uci set/batch/commit anywhere in src/apmond"
 
@@ -211,7 +244,7 @@ R cleanup; C cleanup
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
-$SUDO ip link del apmdum0 2>/dev/null; $SUDO ip link del apmbr0 2>/dev/null; $SUDO ip link del apmbr1 2>/dev/null
+$SUDO ip link del apmdum0 2>/dev/null; $SUDO ip link del apmbr0 2>/dev/null; $SUDO ip link del apmbr1 2>/dev/null; $SUDO ip link del apmbr2 2>/dev/null
 echo
 echo "Result: $pass passed, $fail failed (work dir $W)"
 [ "$fail" -eq 0 ]

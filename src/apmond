@@ -120,6 +120,11 @@ load_config() {
 	is_uint "$debuglevel" || debuglevel=1
 	is_uint "$apmon_verbose_debug_enable" || apmon_verbose_debug_enable=0
 	is_uint "$router_detect" || router_detect=1
+	router_takeover_misses=$(get_option setup router_takeover_misses 3)
+	is_uint "$router_takeover_misses" || router_takeover_misses=3
+	[ "$router_takeover_misses" -lt 1 ] && router_takeover_misses=1
+	claim_delay_max=$(get_option setup claim_delay_max 10)
+	is_uint "$claim_delay_max" || claim_delay_max=10
 	is_uint "$default_seed_warn_interval" || default_seed_warn_interval=21600
 
 	derive_ids
@@ -250,16 +255,145 @@ manage_ula() {
 
 	get_device_mac
 
-	# Part 1: router ::1 on the router only, removed if this node is no longer the router
-	if [ "$detected_state" = "router" ]; then
-		ula_addr_add "$router_ula/64" "$id_device"
-	else
-		ula_addr_del "$router_ula/64" "$id_device"
-	fi
+	# Part 1: router ::1 - first come wins (see claim_router_ula)
+	claim_router_ula
 
 	# Part 2: deterministic per node ULA on all nodes (also creates the on-link /64 route)
 	node_ula="$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
 	ula_addr_add "$node_ula/64" "$id_device"
+}
+
+#############################################
+# Multi-router handling: first come wins (no RA)
+#############################################
+load_role() {
+	role=""; role_reason=""; ula1_misses=0; claim_delay_done=0
+	[ -f "$tmpdir/role" ] && . "$tmpdir/role"
+	is_uint "$ula1_misses" || ula1_misses=0
+}
+
+set_role() {
+	# $1 role (router|backed-off|peer), $2 reason
+	if [ "$1" != "$role" ]; then
+		log_notice "apmond - role change [ ${role:-none} ] -> [ $1 ]: $2"
+	fi
+
+	role="$1"; role_reason="$2"
+	echo "role=\"$role\"; role_reason=\"$role_reason\"; ula1_misses=\"$ula1_misses\"; claim_delay_done=\"$claim_delay_done\"" > "$tmpdir/role"
+}
+
+holding_router_ula() {
+	ip -6 addr show dev "$id_device" 2>/dev/null | grep -q "inet6 $router_ula/64 "
+}
+
+router_ula_dadfailed() {
+	ip -6 addr show dev "$id_device" 2>/dev/null | grep "inet6 $router_ula/64 " | grep -q "dadfailed"
+}
+
+router_ula_answers() {
+	# Is <ula>::1 in use by another node? (same ping form as mesh11sd ping_portal_diag)
+	ping -c 1 -W 1 "$router_ula" >/dev/null 2>&1
+}
+
+random_delay() {
+	# 0..$1 seconds, BusyBox only
+	local max="$1" r
+	is_uint "$max" || return 0
+	[ "$max" -gt 0 ] || return 0
+	r=$(hexdump -n 2 -e '1/2 "%u"' /dev/urandom 2>/dev/null)
+	is_uint "$r" || r=$(awk 'BEGIN {srand(); printf "%d", rand() * 65535}')
+	sleep $((r % (max + 1)))
+}
+
+claim_router_ula() {
+	load_role
+
+	# Not a router candidate: never hold ::1
+	if [ "$detected_state" != "router" ]; then
+		ula1_misses=0
+
+		if holding_router_ula; then
+			ula_addr_del "$router_ula/64" "$id_device"
+		fi
+
+		set_role "peer" "no upstream gateway detected (router_detect=$router_detect)"
+		return 0
+	fi
+
+	# Already holding ::1: check DAD did not fail
+	if holding_router_ula; then
+
+		if router_ula_dadfailed; then
+			ula_addr_del "$router_ula/64" "$id_device"
+			ula1_misses=0
+			set_role "backed-off" "DAD failed on $router_ula after claiming - another router holds it"
+		else
+			ula1_misses=0
+			set_role "router" "upstream gateway detected and $router_ula claimed (collector)"
+		fi
+
+		return 0
+	fi
+
+	# Router candidate without ::1
+	if router_ula_answers; then
+		ula1_misses=0
+		set_role "backed-off" "upstream gateway detected but $router_ula is already in use by another router"
+		return 0
+	fi
+
+	if [ "$role" = "backed-off" ]; then
+		ula1_misses=$((ula1_misses + 1))
+
+		if [ "$ula1_misses" -lt "$router_takeover_misses" ]; then
+			set_role "backed-off" "$router_ula not answering ($ula1_misses/$router_takeover_misses), waiting before takeover"
+			return 0
+		fi
+
+		log_notice "apmond - $router_ula not answering for $ula1_misses consecutive checks, re-running router detection"
+		get_router_state
+
+		if [ "$detected_state" != "router" ]; then
+			ula1_misses=0
+			set_role "peer" "no upstream gateway detected on recheck"
+			return 0
+		fi
+	fi
+
+	# Small random delay before the first claim to reduce simultaneous claims, then check again
+	if [ "$claim_delay_done" != "1" ]; then
+		claim_delay_done=1
+		random_delay "$claim_delay_max"
+
+		if router_ula_answers; then
+			ula1_misses=0
+			set_role "backed-off" "$router_ula claimed by another router during the startup delay"
+			return 0
+		fi
+	fi
+
+	ula_addr_add "$router_ula/64" "$id_device" || {
+		set_role "backed-off" "failed to add $router_ula"
+		return 1
+	}
+
+	# Wait for DAD to complete (default 1 probe, 1 s), then check the flags
+	local i
+	for i in 1 2 3; do
+		ip -6 addr show dev "$id_device" 2>/dev/null | grep "inet6 $router_ula/64 " | grep -q "tentative" || break
+		router_ula_dadfailed && break
+		sleep 1
+	done
+
+	if router_ula_dadfailed; then
+		ula_addr_del "$router_ula/64" "$id_device"
+		ula1_misses=0
+		set_role "backed-off" "DAD failed on $router_ula - another router holds it"
+		return 0
+	fi
+
+	ula1_misses=0
+	set_role "router" "upstream gateway detected and $router_ula claimed (collector)"
 }
 
 cleanup_ula() {
@@ -270,6 +404,10 @@ cleanup_ula() {
 			ip -6 addr del "$addr" dev "$dev" 2>/dev/null && log_notice "apmond - ULA address $addr deleted from $dev"
 		done < "$tmpdir/ula_addrs"
 		rm -f "$tmpdir/ula_addrs"
+	fi
+
+	if [ -f "$tmpdir/role" ]; then
+		rm -f "$tmpdir/role"
 	fi
 }
 
@@ -1860,9 +1998,11 @@ show_status() {
 	if [ -n "$apmon_seed" ]; then
 		get_device_mac
 		[ -f "$tmpdir/is_router" ] && . "$tmpdir/is_router"
+		load_role
 		echo "apmon_id=$apmon_id ula_prefix=$ula_prefix ula_subnet=$ula_subnet"
 		echo "collector=[$router_ula] device=$id_device ap_mac_id=$device_mac bridges=$bridges"
-		echo "role=${detected_state:-unknown (daemon not run yet)}"
+		echo "role=${role:-unknown (daemon not run yet)}"
+		[ -n "$role_reason" ] && echo "role_reason: $role_reason"
 		echo "node_ula=$ula_base:$ula_subnet:$(eui64_iid "$device_mac")"
 	fi
 
@@ -1902,7 +2042,7 @@ run_daemon() {
 	last_seed_warning=$(date +%s)
 	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
 	trap 'cleanup_ula; exit 0' INT TERM
-	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc"
+	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc" "$tmpdir/role"
 	outputfile="$tmpdir/wifidetect"
 	wifi_chipset_detect
 	get_router_state
@@ -1932,7 +2072,7 @@ case "$1" in
 	status) show_status;;
 	show_ap_data) show_ap_data "$2";;
 	send) send_ap_data; exit $?;;
-	detect) get_router_state; manage_ula; echo "$detected_state";;
+	detect) get_router_state; manage_ula; echo "$role";;
 	cleanup) cleanup_ula;;
 	daemon) run_daemon;;
 	write_node_data) write_node_data "$2" "$3"; exit $?;;
