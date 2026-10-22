@@ -2224,39 +2224,108 @@ show_ap_data() {
 	exit 0
 }
 
-show_status() {
-	echo "apmond version $version (protocol v$protocol_version)"
-	echo
-	if [ "$default_seed_in_use" -eq 1 ]; then
-		echo "seed=DEFAULT  *** WARNING: the default built-in passphrase is in use - INSECURE, anyone knowing it can read/inject AP data."
-		echo "              Set option apmon_seed in /etc/config/apmond (the same on every node) ***"
-	else
-		echo "seed=custom"
-	fi
+# json_str <string>: JSON string body (escapes \ and ", strips control characters)
+json_str() {
+	printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
 
-	echo "enabled=$enabled interval=${interval}s router_detect=$router_detect"
+# daemon_pid: pid of a running "apmond daemon" (BusyBox: scan /proc)
+daemon_pid() {
+	local d cmd
+	for d in /proc/[0-9]*; do
+		[ "${d#/proc/}" = "$$" ] && continue
+		cmd=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null)
+		case "$cmd" in
+			*apmond\ daemon*) echo "${d#/proc/}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# show_status: JSON, same style as node_status in show_ap_data. Never shows the passphrase or the secret (nor apmon_id, derived from it).
+show_status() {
+	local seed_default="no" b sep pid running="no" ifaces="" i addrs a first aps
+
+	[ "$default_seed_in_use" -eq 1 ] && seed_default="yes"
+	pid=$(daemon_pid) && running="yes"
+	aps=$(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)
+
+	echo "{"
+	echo "  \"apmond_status\": {"
+	echo "    \"apmond_version\": \"$(json_str "$version")\","
+	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
+	echo "    \"enabled\": \"$(json_str "$enabled")\","
+	echo "    \"daemon_running\": \"$running\","
+	echo "    \"daemon_pid\": \"${pid:-none}\","
+	echo "    \"interval_seconds\": \"$(json_str "$interval")\","
+	echo "    \"router_detect\": \"$(json_str "$router_detect")\","
+	echo "    \"default_passphrase\": \"$seed_default\","
+	[ "$seed_default" = "yes" ] && echo "    \"passphrase_warning\": \"INSECURE: the default built-in passphrase is in use, anyone knowing it can read/inject AP data. Set option apmon_seed in /etc/config/apmond (the same on every node)\","
 
 	if [ -n "$apmon_seed" ]; then
 		get_device_mac
 		[ -f "$tmpdir/is_router" ] && . "$tmpdir/is_router"
 		load_role
-		echo "apmon_id=$apmon_id ula_prefix=$ula_prefix ula_subnet=$ula_subnet"
-		echo "collector=[$router_ula] device=$id_device ap_mac_id=$device_mac bridges=$bridges"
-		echo "role=${role:-unknown (daemon not run yet)}"
-		[ -n "$role_reason" ] && echo "role_reason: $role_reason"
-		echo "node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")"
+		echo "    \"ula_prefix\": \"$(json_str "$ula_prefix")\","
+		echo "    \"ula_subnet\": \"$(json_str "$ula_subnet")\","
+		echo "    \"collector\": \"$(json_str "$router_ula")\","
+		echo "    \"device\": \"$(json_str "$id_device")\","
+		echo "    \"ap_mac_id\": \"$(json_str "$device_mac")\","
+		printf '    "bridges": ['
+		sep=""
+		for b in $bridges; do
+			printf '%s"%s"' "$sep" "$(json_str "$b")"
+			sep=", "
+		done
+		echo "],"
+		echo "    \"role\": \"$(json_str "${role:-unknown (daemon not run yet)}")\","
+		echo "    \"role_reason\": \"$(json_str "${role_reason:-none}")\","
+		echo "    \"node_ula\": \"$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")\","
+
+		for i in $id_device $bridges; do
+			case " $ifaces " in *" $i "*) ;; *) ifaces="$ifaces $i" ;; esac
+		done
+		echo "    \"ula_addresses\": {"
+		first=1
+		for i in $ifaces; do
+			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base:" '$1=="inet6" && index($2,p)==1 {print $2}')
+			[ "$first" -eq 1 ] || echo ","
+			first=0
+			printf '      "%s": [' "$(json_str "$i")"
+			sep=""
+			for a in $addrs; do
+				printf '%s"%s"' "$sep" "$(json_str "$a")"
+				sep=", "
+			done
+			printf ']'
+		done
+		echo
+		echo "    },"
 	fi
 
 	if [ -f "$tmpdir/last_send" ]; then
 		. "$tmpdir/last_send"
-		echo "last send: $last_send, status=$last_status, retcode=$last_retcode, bytes=$last_bytes"
+		echo "    \"last_send\": {"
+		echo "      \"date_time\": \"$(json_str "$last_send")\","
+		echo "      \"status\": \"$(json_str "$last_status")\","
+		echo "      \"retcode\": \"$(json_str "$last_retcode")\","
+		echo "      \"bytes\": \"$(json_str "$last_bytes")\""
+		echo "    },"
 	fi
 
-	echo "storage: log_mountpoint=$log_mountpoint, AP data in $datadir/apmond_data"
-	echo "log:     $logfile$([ -n "$log_disabled_reason" ] && echo " (DISABLED: $log_disabled_reason)")"
-	echo "runtime: $tmpdir (volatile: role, ULA address list, staging, last_ts)"
-	[ -n "$datadir_reason" ] && echo "         WARNING: $datadir_reason"
-	echo "access points with data on this node: $(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)"
+	echo "    \"log_mountpoint\": \"$(json_str "$log_mountpoint")\","
+	echo "    \"ap_data_dir\": \"$(json_str "$datadir/apmond_data")\","
+	[ -n "$datadir_reason" ] && echo "    \"storage_warning\": \"$(json_str "$datadir_reason")\","
+	echo "    \"log_file\": \"$(json_str "$logfile")\","
+	if [ -n "$log_disabled_reason" ]; then
+		echo "    \"logging\": \"DISABLED: $(json_str "$log_disabled_reason")\","
+	else
+		echo "    \"logging\": \"enabled\","
+	fi
+	echo "    \"runtime_dir\": \"$(json_str "$tmpdir")\","
+	echo "    \"access_points_with_data\": \"$aps\""
+	echo "  }"
+	echo "}"
 }
 
 warn_default_seed() {

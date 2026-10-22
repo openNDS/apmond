@@ -69,7 +69,11 @@ node() { n=$1; shift; MOCK_NODE=$n MOCK_UCI_DIR="$W/uci-$n" MOCK_IP_DIR="$W/ip-$
 R() { MOCK_WAN_UP=${WAN:-1} node R "$@"; }
 C() { MOCK_WAN_UP=0 node C "$@"; }
 S() { MOCK_WAN_UP=1 node S "$@"; }
-st() { "$@" status | awk -v k="$KEY=" '{for (i=1;i<=NF;i++) if (index($i,k)==1) print substr($i,length(k)+1)}'; }
+# status is JSON: jv KEY < status  prints apmond_status.KEY (lists space separated, objects as JSON)
+jv() { "$PY" -c 'import json,sys
+v=json.load(sys.stdin)["apmond_status"].get(sys.argv[1],"")
+print(" ".join(v) if isinstance(v,list) else (json.dumps(v) if isinstance(v,dict) else v))' "$1"; }
+st() { "$@" status | jv "$KEY"; }
 json_ok() { "$PY" -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; }
 
 echo "== syntax"
@@ -97,14 +101,15 @@ nw=$(grep -c "daemon.crit .*\*\*\* WARNING \*\*\* apmond is using the DEFAULT" "
 grep -q "daemon.crit .*READ and INJECT" "$W/log" && grep -q "daemon.crit .*option apmon_seed in /etc/config/apmond" "$W/log" && ok "warning explains the risk and how to set option apmon_seed" || ko "warning text"
 [ "$(grep -c "daemon.crit apmond\[[0-9]*\]: \[[0-9]*\] \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/tmp-N/apmond_log.log")" -ge 2 ] && ok "default passphrase warning also written to the apmond log file" || ko "crit not in log file"
 grep -q "add fd" "$W/ip-N/log" 2>/dev/null && ok "default seed: daemon runs normally (ULA applied, report attempted)" || ko "default seed daemon did not run"
-N status | grep -q "seed=DEFAULT .*INSECURE" && ok "status shows the default passphrase is in use" || ko "status default"
+[ "$(N status | jv default_passphrase)" = yes ] && N status | jv passphrase_warning | grep -q INSECURE && ok "status shows the default passphrase is in use" || ko "status default"
 echo "apmond.setup.apmon_seed='--__'" >> "$W/uci-N/apmond"
-N status | grep -q "seed=DEFAULT" && ok "seed explicitly set to the default is treated as default" || ko "explicit default"
+[ "$(N status | jv default_passphrase)" = yes ] && ok "seed explicitly set to the default is treated as default" || ko "explicit default"
 : > "$W/log"; sed -i "s/apmon_seed='--__'/apmon_seed='private'/" "$W/uci-N/apmond"
-N status | grep -q "seed=custom" && ok "custom seed: status shows custom" || ko "custom status"
+[ "$(N status | jv default_passphrase)" = no ] && ! N status | grep -q "private\|passphrase_warning" && ok "custom seed: status shows custom" || ko "custom status"
 N cleanup
 R0=$(printf '%s' '--__' | busybox sha256sum | awk '{printf "%s", $1}' | tail -c55 | head -c30)
-[ "$R0" = "$(MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/run-O0" APMOND_TMP_DATADIR="$W/tmp-O0" busybox sh "$REPO/src/apmond" status | awk '{for(i=1;i<=NF;i++) if (index($i,"apmon_id=")==1) print substr($i,10)}')" ] && ok "default seed is the mesh11sd auto_mesh_id default \"--__\"" || ko "default seed value"
+R0P="fd$(echo "$R0" | cut -c10-11):$(echo "$R0" | cut -c12-15):$(echo "$R0" | cut -c16-19)::/48"
+[ "$R0P" = "$(MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/run-O0" APMOND_TMP_DATADIR="$W/tmp-O0" busybox sh "$REPO/src/apmond" status | jv ula_prefix)" ] && ok "default seed is the mesh11sd auto_mesh_id default \"--__\"" || ko "default seed value"
 
 echo "== 1. derivation from apmon_seed (mirrors mesh11sd auto_mesh_id / set_ula_prefix)"
 REF=$("$PY" - "$SEED" <<'EOP'
@@ -116,15 +121,15 @@ print(i, base+"::/48", i[19:23], ipaddress.IPv6Address(base+":"+i[19:23]+"::1").
 EOP
 )
 set -- $REF
-KEY=apmon_id; a=$(st R); KEY=ula_prefix; p=$(st R); KEY=ula_subnet; sn=$(st R); KEY=collector; col=$(st C)
-[ "$a" = "$1" ] && ok "apmon_id = sha256(seed) | tail -c55 | head -c30 ($a)" || ko "apmon_id $a != $1"
+KEY=ula_prefix; p=$(st R); KEY=ula_subnet; sn=$(st R); KEY=collector; col=$(st C)
+! R status | grep -q "$1" && ! R status | grep -q "$(printf '%s' "$SEED" | busybox sha256sum | cut -c1-16)" && ! R status | grep -qF "$SEED" && ok "status JSON never shows the passphrase, the secret or apmon_id" || ko "status leaks seed/secret"
 [ "$p" = "$2" ] && ok "ula_prefix = fd\${id:9:2}:\${id:11:4}:\${id:15:4}::/48 ($p)" || ko "ula_prefix $p != $2"
 [ "$sn" = "$3" ] && ok "ula_subnet = \${id:19:4} ($sn)" || ko "subnet $sn != $3"
-[ "$col" = "[$4]" ] && ok "peer collector address = $col" || ko "collector $col != [$4]"
+[ "$col" = "$4" ] && ok "peer collector address = $col" || ko "collector $col != [$4]"
 RULA=$4
 sed "s/apmon_seed='.*'/apmon_seed='another seed'/" "$W/uci-C/apmond" > "$W/other"; mkdir -p "$W/uci-O"; cp "$W/other" "$W/uci-O/apmond"
-KEY=collector; o=$(MOCK_UCI_DIR="$W/uci-O" APMOND_TMPDIR="$W/run-O" APMOND_TMP_DATADIR="$W/tmp-O" busybox sh "$REPO/src/apmond" status | awk -F= '/collector=/ {print $2}' | cut -d' ' -f1)
-[ "$o" != "[$RULA]" ] && ok "a different seed gives a different collector ULA ($o)" || ko "other seed same ULA"
+KEY=collector; o=$(MOCK_UCI_DIR="$W/uci-O" APMOND_TMPDIR="$W/run-O" APMOND_TMP_DATADIR="$W/tmp-O" busybox sh "$REPO/src/apmond" status | jv collector)
+[ -n "$o" ] && [ "$o" != "$RULA" ] && ok "a different seed gives a different collector ULA ($o)" || ko "other seed same ULA"
 
 echo "== 2. identical config on every node, role selected at runtime"
 diff <(grep -v "\.device=" "$W/uci-R/apmond") <(grep -v "\.device=" "$W/uci-C/apmond") >/dev/null 2>&1 || true
@@ -152,12 +157,12 @@ mkdir -p "$W/uci-S"; cp "$W/uci-R/"* "$W/uci-S/"; sed -i "s/device='apmbr1'/devi
 echo "system.@system[0].hostname='router2'" > "$W/uci-S/system"
 r=$(S detect)
 [ "$r" = "backed-off" ] && ! grep -q "$RULA/64" "$W/ip-S/addr_apmbr2" && ok "second router S sees $RULA answering and backs off without claiming" || ko "S backoff: $r"
-S status | grep -q "role=backed-off" && S status | grep -q "role_reason: .*already in use" && ok "status shows role=backed-off and why" || ko "S status"
+[ "$(S status | jv role)" = backed-off ] && S status | jv role_reason | grep -q "already in use" && ok "status shows role=backed-off and why" || ko "S status"
 grep -q "role change \[ none \] -> \[ backed-off \]" "$W/log" && ok "role change logged to syslog" || ko "role change log"
 # Failover: R goes away
 R cleanup
 r1=$(S detect); r2=$(S detect)
-[ "$r1" = "backed-off" ] && [ "$r2" = "backed-off" ] && S status | grep -q "not answering (2/3)" && ok "R gone: S waits (misses 1/3, 2/3)" || ko "S wait $r1 $r2"
+[ "$r1" = "backed-off" ] && [ "$r2" = "backed-off" ] && S status | jv role_reason | grep -q "not answering (2/3)" && ok "R gone: S waits (misses 1/3, 2/3)" || ko "S wait $r1 $r2"
 r3=$(S detect)
 [ "$r3" = "router" ] && grep -q "inet6 $RULA/64 " "$W/ip-S/addr_apmbr2" && ok "after 3 consecutive misses S re-runs detection and claims $RULA" || ko "S takeover $r3"
 grep -q "re-running router detection" "$W/log" && grep -q "role change \[ backed-off \] -> \[ router \]" "$W/log" && ok "takeover logged" || ko "takeover log"
@@ -168,7 +173,7 @@ r=$(R detect)
 R cleanup
 r=$(MOCK_PING_BLOCK=1 R detect)
 [ "$r" = "backed-off" ] && ! grep -q "$RULA/64" "$W/ip-R/addr_apmbr1" && grep -q "add $RULA/64 apmbr1 dadfailed" "$W/ip-R/log" && ok "claim with DAD failure: address dropped, R backs off" || ko "DAD claim $r"
-R status | grep -q "role_reason: DAD failed" && ok "status reason: DAD failed" || ko "DAD status"
+R status | jv role_reason | grep -q "^DAD failed" && ok "status reason: DAD failed" || ko "DAD status"
 # DAD failure after claiming (flag appears later on the holder)
 sed -i "s#inet6 $RULA/64 scope global\$#inet6 $RULA/64 scope global dadfailed#" "$W/ip-S/addr_apmbr2"
 r=$(S detect)
@@ -202,11 +207,11 @@ grep -q '"OpenWrt@phy0-ap0"' "$W/report.json" && grep -q '"OpenWrt5@phy1-ap0"' "
 grep -q -e '"Guest@' -e '"Off@' "$W/report.json" && ko "down/disabled ifaces included" || ok "down/disabled wifi-ifaces skipped"
 grep -q '"apmdum0@apmbr0"' "$W/report.json" && grep -q '02:aa:bb:cc:dd:01' "$W/report.json" && ok "wired client found on bridge without any mesh interface" || ko "wired client scan"
 cp "$W/uci-C/apmond" "$W/cb.bak"; echo "apmond.setup.bridge='apmbr2' 'apmbr0'" >> "$W/uci-C/apmond"
-C status | grep -q "bridges=apmbr2 apmbr0\$" && ok "list bridge: status shows both bridges" || ko "list bridge status"
+[ "$(C status | jv bridges)" = "apmbr2 apmbr0" ] && ok "list bridge: status shows both bridges" || ko "list bridge status"
 C send && R show_ap_data "$CID" | grep -q '"apmdum0@apmbr0"' && ok "list bridge: wired client still found on 2nd list bridge" || ko "list bridge wired scan"
 cp "$W/cb.bak" "$W/uci-C/apmond"; echo "apmond.setup.bridge='apmbr0'" >> "$W/uci-C/apmond"
-C status | grep -q "bridges=apmbr0\$" && ok "legacy single option bridge still works" || ko "legacy option bridge"
-cp "$W/cb.bak" "$W/uci-C/apmond"; C status | grep -q "bridges=apmbr0\$" && ok "bridge defaults to device" || ko "bridge default"
+[ "$(C status | jv bridges)" = "apmbr0" ] && ok "legacy single option bridge still works" || ko "legacy option bridge"
+cp "$W/cb.bak" "$W/uci-C/apmond"; [ "$(C status | jv bridges)" = "apmbr0" ] && ok "bridge defaults to device" || ko "bridge default"
 R show_ap_data all > "$W/all.json"; json_ok < "$W/all.json" && [ "$(grep -c '"clients@' "$W/all.json")" -eq 2 ] && ok "show_ap_data all: valid JSON, 2 APs" || ko "show_ap_data all"
 C show_ap_data | grep -q "$CID" && ko "peer stored data" || ok "peer stores nothing (reports only go to the router)"
 
@@ -250,7 +255,7 @@ n=$(grep -c '"02:00:00:00:' "$W/big.json")
 
 echo "== 5b. storage location (log_mountpoint, as mesh11sd)"
 RID=$(cat /sys/class/net/apmbr1/address | tr -d :)
-R status | grep -q "storage: log_mountpoint=/tmp, AP data in $W/tmp-R/apmond_data" && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "default: log_mountpoint=/tmp, store in /tmp/apmond/apmond_data (test override $W/tmp-R)" || ko "default storage"
+[ "$(R status | jv log_mountpoint)" = /tmp ] && [ "$(R status | jv ap_data_dir)" = "$W/tmp-R/apmond_data" ] && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "default: log_mountpoint=/tmp, store in /tmp/apmond/apmond_data (test override $W/tmp-R)" || ko "default storage"
 mkdir -p "$W/usb"
 PATH="$SPATH" $SUDO mount -t tmpfs -o "size=4m,uid=$(id -u),gid=$(id -g)" apmtest "$W/usb"
 cp "$W/uci-R/apmond" "$W/r.bak"
@@ -258,14 +263,14 @@ echo "apmond.setup.log_mountpoint='$W/usb'" >> "$W/uci-R/apmond"
 sleep 1
 C send; R send
 [ -f "$W/usb/apmond/apmond_data/$CID" ] && [ -f "$W/usb/apmond/apmond_data/$RID" ] && ok "custom mountpoint: CGI stores reports in <log_mountpoint>/apmond/apmond_data/<mac>" || ko "custom store"
-R status | grep -q "storage: log_mountpoint=$W/usb, AP data in $W/usb/apmond/apmond_data" && ok "status shows the custom storage path" || ko "custom status"
+[ "$(R status | jv log_mountpoint)" = "$W/usb" ] && [ "$(R status | jv ap_data_dir)" = "$W/usb/apmond/apmond_data" ] && ok "status shows the custom storage path" || ko "custom status"
 R show_ap_data | grep -q "$CID" && R show_ap_data "$CID" | json_ok && ok "show_ap_data reads from the custom mountpoint" || ko "custom show"
 PATH="$SPATH" $SUDO mount -o remount,ro "$W/usb"
-R status | grep -q "WARNING: log_mountpoint \[ $W/usb \] is not writable - falling back to /tmp" && R status | grep -q "AP data in $W/tmp-R/apmond_data" && ok "mounted but read-only: falls back to /tmp with a warning" || ko "ro fallback"
+R status | jv storage_warning | grep -q "log_mountpoint \[ $W/usb \] is not writable - falling back to /tmp" && [ "$(R status | jv ap_data_dir)" = "$W/tmp-R/apmond_data" ] && ok "mounted but read-only: falls back to /tmp with a warning" || ko "ro fallback"
 PATH="$SPATH" $SUDO umount "$W/usb"
-R status | grep -q "WARNING: log_mountpoint \[ $W/usb \] is not mounted - falling back to /tmp" && ok "media removed (not mounted): falls back to /tmp, as mesh11sd" || ko "unmounted fallback"
+R status | jv storage_warning | grep -q "log_mountpoint \[ $W/usb \] is not mounted - falling back to /tmp" && ok "media removed (not mounted): falls back to /tmp, as mesh11sd" || ko "unmounted fallback"
 sed -i "s#log_mountpoint=.*#log_mountpoint='$W/does-not-exist'#" "$W/uci-R/apmond"
-R status | grep -q "is not mounted - falling back to /tmp" && [ ! -d "$W/does-not-exist" ] && ok "missing mountpoint: falls back to /tmp, nothing created" || ko "missing fallback"
+R status | jv storage_warning | grep -q "is not mounted - falling back to /tmp" && [ ! -d "$W/does-not-exist" ] && ok "missing mountpoint: falls back to /tmp, nothing created" || ko "missing fallback"
 sleep 1; C send && [ -f "$W/tmp-R/apmond_data/$CID" ] && ok "reports still stored after fallback" || ko "store after fallback"
 cp "$W/r.bak" "$W/uci-R/apmond"
 grep -q "^[[:space:]]*#option log_mountpoint '/tmp'" "$REPO/linux_openwrt/apmond/files/etc/config/apmond" && ok "shipped config has a commented log_mountpoint example" || ko "config example"
@@ -274,7 +279,7 @@ echo "== 5c. runtime state in the volatile run directory"
 [ -f "$W/run-R/role" ] && [ -f "$W/run-R/ula_addrs" ] && [ -f "$W/run-C/last_send" ] && [ -d "$W/run-R/staging" ] && [ -d "$W/run-R/last_ts" ] && ok "role, ULA list, last_send, staging/, last_ts/ in the run dir" || ko "run dir contents"
 [ ! -e "$W/tmp-R/role" ] && [ ! -e "$W/tmp-R/staging" ] && [ ! -e "$W/tmp-R/last_ts" ] && [ ! -e "$W/tmp-R/ula_addrs" ] && ok "data dir holds only apmond_data/" || ko "state in data dir: $(ls "$W/tmp-R")"
 grep -q 'tmpdir="${APMOND_TMPDIR:-/var/run/apmond}"' "$REPO/src/apmond" && grep -q "mkdir -p /var/run/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ok "default run dir /var/run/apmond, created at start" || ko "run dir default"
-R status | grep -q "runtime: $W/run-R" && ok "status shows the run dir" || ko "status run dir"
+[ "$(R status | jv runtime_dir)" = "$W/run-R" ] && ok "status shows the run dir" || ko "status run dir"
 [ -z "$(ls -A "$W/tmp-R/apmond_data" | grep '^\.')" ] && ok "no temp or partial files left in apmond_data" || ko "temp files in apmond_data"
 grep -q '> "$datadir/apmond_data/.$node_mac.tmp" && mv "$datadir/apmond_data/.$node_mac.tmp" "$datadir/apmond_data/$node_mac"' "$REPO/src/apmond" && ok "verified report written to a temp file inside apmond_data, then renamed (atomic for readers)" || ko "atomic write"
 # A half-received report leaves nothing in apmond_data, only in the run dir staging
@@ -290,7 +295,7 @@ LF="$W/tmp-R/apmond_log.log"
 grep -q "^.* daemon\.warn apmond\[[0-9]*\]: \[[0-9]*\] apmond - Bad signature" "$LF" && ok "line format: '<date> daemon.<level> apmond[pid]: [n] message'" || ko "log line format"
 ! grep -q "Bad signature" "$W/log" && ok "warn level messages go to the log file only, not syslog" || ko "warn reached syslog"
 grep -q "role change" "$LF" && grep -q "daemon.notice.*role change" "$W/log" && ok "notice (router role changes) go to syslog AND the log file" || ko "notice split"
-R status | grep -q "log:     $LF" && ok "status shows the log path" || ko "status log path"
+[ "$(R status | jv log_file)" = "$LF" ] && ok "status shows the log path" || ko "status log path"
 [ "$(R read_log | busybox md5sum)" = "$(busybox md5sum < "$LF")" ] && ok "read_log prints the log file (CLI resolves the same path as the CGI)" || ko "read_log"
 MOCK_UCI_DIR="$W/uci-O0" MOCK_IP_DIR="$W/ip-O0" APMOND_TMPDIR="$W/run-O0" APMOND_TMP_DATADIR="$W/empty-O0" busybox sh "$REPO/src/apmond" read_log; [ $? -eq 1 ] && ok "read_log with no log file exits 1" || ko "read_log no file"
 cp "$LF" "$W/lf.bak"
@@ -301,7 +306,7 @@ grep -q "New log file created" "$W/follow.out" && grep -q "Stale timestamp\|Bad 
 mkdir -p "$W/small"; PATH="$SPATH" $SUDO mount -t tmpfs -o "size=96k,uid=$(id -u),gid=$(id -g)" apmsmall "$W/small"
 cp "$W/uci-R/apmond" "$W/r2.bak"; echo "apmond.setup.log_mountpoint='$W/small'" >> "$W/uci-R/apmond"
 raw "apmond;evil2;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null
-R status | grep -q "log:     $W/small/apmond/apmond_log.log" && grep -q "evil2\|Stale\|signature" "$W/small/apmond/apmond_log.log" && ok "custom mount: CGI and CLI use <log_mountpoint>/apmond/apmond_log.log" || ko "custom mount log"
+[ "$(R status | jv log_file)" = "$W/small/apmond/apmond_log.log" ] && grep -q "evil2\|Stale\|signature" "$W/small/apmond/apmond_log.log" && ok "custom mount: CGI and CLI use <log_mountpoint>/apmond/apmond_log.log" || ko "custom mount log"
 busybox dd if=/dev/zero of="$W/small/fill" bs=1k count=200 2>/dev/null
 avail=$(busybox df "$W/small" | awk 'NR>1 {print $(NF-2)}')
 : > "$W/log"; sz=$(wc -c < "$W/small/apmond/apmond_log.log")
@@ -313,7 +318,7 @@ sed -i "s#log_mountpoint=.*#log_mountpoint='$W/not-mounted'#" "$W/uci-R/apmond"
 : > "$W/log"; before=$(wc -l < "$LF")
 raw "apmond;evil4;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null
 [ "$(grep -c "daemon.err.*Log location is NOT a mountpoint - logs would fill storage space - logging disabled" "$W/log")" -eq 1 ] && [ "$before" -eq "$(wc -l < "$LF")" ] && ok "not a mountpoint: 'logging disabled' to syslog once, nothing written to the file" || ko "not a mountpoint"
-R status | grep -q "DISABLED: Log location is NOT a mountpoint" && ok "status shows logging disabled" || ko "status disabled"
+R status | jv logging | grep -q "DISABLED: Log location is NOT a mountpoint" && ok "status shows logging disabled" || ko "status disabled"
 cp "$W/r2.bak" "$W/uci-R/apmond"
 # max_log_entries truncation
 echo "apmond.setup.max_log_entries='5'" >> "$W/uci-R/apmond"
@@ -323,7 +328,12 @@ cp "$W/r2.bak" "$W/uci-R/apmond"
 
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
-C status | grep -q "role=peer" && R status | grep -q "role=router" && ok "status shows role" || ko "status"
+[ "$(C status | jv role)" = peer ] && [ "$(R status | jv role)" = router ] && ok "status shows role" || ko "status"
+R status | "$PY" -m json.tool >/dev/null && C status | "$PY" -m json.tool >/dev/null && ok "status output is valid JSON (python json.tool)" || ko "status not JSON"
+{ [ -z "$JF" ] || [ "$(R status | jsonfilter -e '@.apmond_status.role')" = router ]; } && ok "status JSON readable with jsonfilter (if present)" || ko "jsonfilter status"
+R detect >/dev/null; R status | jv ula_addresses | grep -q "$RULA/64" && ok "status lists the ULA addresses on the bridges (collector ::1 on R)" || ko "status ula_addresses $(R status | jv ula_addresses)"
+R status | grep -q '^    "apmond_version": ' && R status | grep -q '^  "apmond_status": {' && ok "status uses the node_status style (2-space indent, string keys)" || ko "status style"
+[ "$(R status | jv daemon_running)" = no ] && [ "$(R status | jv daemon_pid)" = none ] && ok "status: daemon not running -> daemon_running no, pid none" || ko "daemon_running"
 R show_ap_data | grep -q "$CID" && ok "show_ap_data list" || ko "list"
 R cleanup; C cleanup
 [ -z "$(grep inet6 "$W/ip-R/addr_apmbr1" "$W/ip-C/addr_apmbr0" 2>/dev/null)" ] && ok "cleanup removed every runtime ULA address" || ko "cleanup"
