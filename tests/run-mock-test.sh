@@ -182,7 +182,7 @@ r=$(S detect)
 S cleanup; R cleanup
 [ "$(R detect)" = "router" ] && ok "R claims again once $RULA is free" || ko "R reclaim"
 for f in R C; do ls "$W/uci-$f" | grep -qv -e apmond -e wireless -e network -e system && ko "unexpected uci file"; done
-grep -E '^[[:space:]]*(echo .*\| *)?uci( -q)? +(set|commit|batch|add|add_list|del|delete|del_list|rename|revert)' "$REPO/src/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ko "uci write in src/apmond" || ok "no uci set/batch/commit anywhere in src/apmond"
+grep -E '^[[:space:]]*(echo .*\| *)?uci( -q)? +(set|commit|batch|add|add_list|del|delete|del_list|rename|revert)' "$REPO/src/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" | grep -v 'uci set apmond.setup.debuglevel="$1" && uci commit apmond' && ko "uci write in src/apmond" || ok "no uci set/batch/commit in src/apmond except the debuglevel CLI"
 
 echo "== 3. end to end over the collector ULA"
 PATH="$SPATH" $SUDO ip -6 addr add "$RULA/128" dev lo 2>/dev/null
@@ -365,6 +365,22 @@ spd() { busybox env PATH="$SW/${3:-bin}:$W/bb" APMOND_SYSFS_NET="$SW/net" SW_V1=
 echo 100 > "$SW/net/eth0.1/speed"; [ "$(spd '1 6t' 'port:1 link:down')" = "100" ] && ok "sysfs speed wins when present" || ko "sysfs speed"
 echo -1 > "$SW/net/eth0.1/speed"; [ "$(spd '1 6t' 'port:1 link:up speed:100baseT full-duplex')" = "100" ] && ok "sysfs -1 falls back to swconfig" || ko "sysfs -1"
 [ "$(busybox env PATH="$W/bb" APMOND_SYSFS_NET="$SW/net" busybox sh -c ". '$SW/fns.sh'; get_link_speed eth9")" = "down" ] && ok "non-VLAN, operstate down -> down" || ko "operstate down"
+
+echo "== 8. debuglevel CLI (committed at once) and live pickup by the daemon"
+mkdir -p "$W/uci-D"; cp "$W/uci-N/apmond" "$W/uci-D/apmond"; cp "$W/uci-N/network" "$W/uci-D/network"
+D() { MOCK_UCI_DIR="$W/uci-D" MOCK_IP_DIR="$W/ip-D" APMOND_TMPDIR="$W/run-D" APMOND_TMP_DATADIR="$W/tmp-D" busybox sh "$REPO/src/apmond" "$@"; }
+[ "$(D debuglevel)" = "1" ] && ok "debuglevel: no argument shows the default 1" || ko "debuglevel default $(D debuglevel)"
+dl_ok=1; for l in 0 1 2 3; do
+	[ "$(D debuglevel $l)" = "$l" ] && [ "$(MOCK_UCI_DIR="$W/uci-D" uci -q get apmond.setup.debuglevel)" = "$l" ] && grep -q "^apmond.setup.debuglevel='$l'$" "$W/uci-D/apmond" && [ -z "$(MOCK_UCI_DIR="$W/uci-D" uci changes apmond)" ] && [ "$(D debuglevel)" = "$l" ] || dl_ok=0
+done
+[ $dl_ok -eq 1 ] && ok "debuglevel 0-3: set, printed, committed (no pending uci changes), shown back" || ko "debuglevel set/commit"
+dl_ok=1; for l in 4 -1 abc; do o=$(D debuglevel "$l"); r=$?; [ "$o" = "Invalid debuglevel requested" ] && [ $r -eq 1 ] || dl_ok=0; done
+[ $dl_ok -eq 1 ] && [ "$(D debuglevel)" = "3" ] && ok "debuglevel 4/-1/abc rejected with exit 1, level unchanged" || ko "debuglevel invalid"
+[ "$(D status | jv debuglevel)" = "3" ] && D status | "$PY" -m json.tool >/dev/null && ok "status JSON includes debuglevel" || ko "status debuglevel"
+D debuglevel 1 >/dev/null; : > "$W/log"
+MOCK_WAN_UP=0 busybox timeout 16 busybox sh -c "MOCK_UCI_DIR=$W/uci-D MOCK_IP_DIR=$W/ip-D APMOND_TMPDIR=$W/run-D APMOND_TMP_DATADIR=$W/tmp-D busybox sh $REPO/src/apmond daemon" 2>/dev/null & DPID=$!
+sleep 3; D debuglevel 3 >/dev/null; wait $DPID
+grep -q "debuglevel changed to \[ 3 \]" "$W/log" "$W/tmp-D/apmond_log.log" 2>/dev/null && grep -q "daemon.debug" "$W/tmp-D/apmond_log.log" 2>/dev/null && ok "running daemon picks up the new debuglevel on its next loop pass (debug entries appear, no restart)" || ko "live debuglevel pickup"
 
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"

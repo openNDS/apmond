@@ -1,11 +1,20 @@
 #!/bin/sh
-# Minimal read-only mock of uci: data in $MOCK_UCI_DIR/<config> in "uci show" format
+# Minimal mock of uci: data in $MOCK_UCI_DIR/<config> in "uci show" format,
+# uncommitted changes staged in $MOCK_UCI_DIR/.<config>.changes until "uci commit <config>"
 [ "$1" = "-q" ] && shift
-cmd="$1"; key="$2"; cfg="${key%%.*}"; f="$MOCK_UCI_DIR/$cfg"
+cmd="$1"; key="$2"; cfg="${key%%.*}"; f="$MOCK_UCI_DIR/$cfg"; c="$MOCK_UCI_DIR/.$cfg.changes"
+case "$cmd" in
+	set) k="${key%%=*}"; v="${key#*=}"; [ -f "$f" ] || exit 1
+	     echo "$k='$v'" >> "$c"; exit 0;;
+	commit) [ -f "$c" ] || exit 0
+	     while IFS= read -r l; do k="${l%%=*}"; grep -v "^$k=" "$f" > "$f.tmp"; echo "$l" >> "$f.tmp"; mv "$f.tmp" "$f"; done < "$c"
+	     rm -f "$c"; exit 0;;
+	changes) if [ -n "$key" ]; then cat "$c" 2>/dev/null; else cat "$MOCK_UCI_DIR"/.*.changes 2>/dev/null; fi; exit 0;;
+esac
 [ -f "$f" ] || exit 1
 case "$cmd" in
 	show) cat "$f";;
-	get) val=$(awk -v k="$key=" 'index($0,k)==1 {print substr($0,length(k)+1); f=1; exit} END {exit !f}' "$f") || exit 1
+	get) val=$(cat "$f" "$c" 2>/dev/null | awk -v k="$key=" 'index($0,k)==1 {v=substr($0,length(k)+1); f=1} END {if (f) print v; exit !f}') || exit 1
 	     echo "$val" | sed "s/' '/ /g; s/^'//; s/'$//";;
 	*) echo "mock uci: unsupported $cmd" >&2; exit 1;;
 esac
