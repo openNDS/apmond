@@ -1938,6 +1938,55 @@ nack() {
 	return 1
 }
 
+# check_node_protocol: collector side, $1 node id (mac12), $2 hex report file.
+# Reads the reporting node's node_status.apmond_protocol straight from the hex (no full decode: hex_to_str
+# takes minutes on big reports) and compares it with our protocol_version. A mismatch never rejects the
+# report (mixed versions are normal while island meshes / cabled AP groups are upgraded), it is logged
+# once per node per protocol value (state in the volatile run dir) and a notice is logged when back in line.
+check_node_protocol() {
+	local node="$1" file="$2" proto state="$tmpdir/protocol_mismatch/$1"
+
+	# hex of: "apmond_protocol": "
+	proto=$(awk 'BEGIN { for (i = 32; i < 127; i++) h[sprintf("%02x", i)] = sprintf("%c", i) }
+		{ p = index($0, "2261706d6f6e645f70726f746f636f6c223a2022"); if (!p) exit
+		  s = substr($0, p + 40, 64); v = ""
+		  for (i = 1; i < length(s); i += 2) { c = substr(s, i, 2); if (c == "22") break; v = v h[c] }
+		  print v; exit }' "$file" 2>/dev/null | tr -cd '0-9A-Za-z._-')
+	if [ -z "$proto" ]; then
+		# mesh11sd-format report (node_status.mesh11sd_version, no apmond_protocol): mesh11sd sends the
+		# protocol 1 format, so it is compatible - note it once at debug level, no warning
+		if grep -q "226d657368313173645f76657273696f6e223a2022" "$file" 2>/dev/null; then
+			proto="$protocol_version"
+			mkdir -p "$tmpdir/protocol_mesh11sd"
+			if [ ! -f "$tmpdir/protocol_mesh11sd/$node" ]; then
+				: > "$tmpdir/protocol_mesh11sd/$node"
+				log_debug "apmond - node [ $node ] is a mesh11sd node (no apmond_protocol), treated as protocol [ $protocol_version ]"
+			fi
+		else
+			proto="0"
+		fi
+	fi
+	mkdir -p "$tmpdir/protocol_mismatch"
+
+	if [ "$proto" = "$protocol_version" ]; then
+		if [ -f "$state" ]; then
+			rm -f "$state"
+			log_notice "apmond - node [ $node ] protocol [ $proto ] now matches collector protocol [ $protocol_version ]"
+		fi
+		return 0
+	fi
+
+	[ -f "$state" ] && [ "$(cat "$state")" = "$proto" ] && return 0
+	echo "$proto" > "$state"
+
+	if [ "$proto" = "0" ]; then
+		log_error "apmond - WARNING node [ $node ] sent no apmond_protocol (protocol 0/unknown), collector protocol [ $protocol_version ] - upgrade apmond on all nodes"
+	else
+		log_error "apmond - WARNING node [ $node ] protocol [ $proto ] differs from collector protocol [ $protocol_version ] - upgrade apmond on all nodes"
+	fi
+	return 0
+}
+
 write_node_data() {
 	node_id="$1"
 	data_raw="$2"
@@ -2097,6 +2146,7 @@ write_node_data() {
 				} > "$datadir/apmond_data/.$node_mac.tmp" && mv "$datadir/apmond_data/.$node_mac.tmp" "$datadir/apmond_data/$node_mac"
 
 				echo -n "$node_ts" > "$tmpdir/last_ts/$node_mac"
+				check_node_protocol "$node_mac" "$staging.data"
 				rm -f "$staging.session" "$staging.ua" "$staging.data"
 				log_info "apmond data received from node [$node_hostname] id [ $node_mac ]"
 				echo -n "*end"
@@ -2329,7 +2379,11 @@ show_status() {
 		echo "    \"logging\": \"enabled\","
 	fi
 	echo "    \"runtime_dir\": \"$(json_str "$tmpdir")\","
-	echo "    \"access_points_with_data\": \"$aps\""
+	echo "    \"access_points_with_data\": \"$aps\","
+	printf '    "protocol_mismatch_nodes": ['
+	sep=""
+	for b in $(ls "$tmpdir/protocol_mismatch/" 2>/dev/null); do printf '%s"%s"' "$sep" "$(json_str "$b")"; sep=", "; done
+	echo "]"
 	echo "  }"
 	echo "}"
 }

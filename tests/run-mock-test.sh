@@ -382,6 +382,29 @@ MOCK_WAN_UP=0 busybox timeout 16 busybox sh -c "MOCK_UCI_DIR=$W/uci-D MOCK_IP_DI
 sleep 3; D debuglevel 3 >/dev/null; wait $DPID
 grep -q "debuglevel changed to \[ 3 \]" "$W/log" "$W/tmp-D/apmond_log.log" 2>/dev/null && grep -q "daemon.debug" "$W/tmp-D/apmond_log.log" 2>/dev/null && ok "running daemon picks up the new debuglevel on its next loop pass (debug entries appear, no restart)" || ko "live debuglevel pickup"
 
+echo "== 9. Collector checks apmond_protocol"
+PT="$W/proto"; mkdir -p "$PT/run"
+awk '/^check_node_protocol\(\) \{/,/^}/' "$REPO/src/apmond" > "$PT/fns.sh"
+hx() { printf '%s' "$1" | busybox hexdump -v -e '1/1 "%02x"'; }
+rep() { hx "{ \"System@02:00:00:0a:00:09\": { \"node_status\": { \"apmond_version\": \"0.1.0\",$1 \"factory_mac\": \"x\" } } }" > "$PT/rep"; }
+chk() { busybox env PATH="$W/bb" busybox sh -c "tmpdir='$PT/run'; protocol_version=1
+log_error() { echo \"ERR \$1\" >> '$PT/log'; }; log_notice() { echo \"NOTICE \$1\" >> '$PT/log'; }; log_debug() { echo \"DEBUG \$1\" >> '$PT/log'; }
+. '$PT/fns.sh'; check_node_protocol 020000aa0009 '$PT/rep'"; }
+: > "$PT/log"; rep ' "apmond_protocol": "1",'; chk; [ ! -s "$PT/log" ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "protocol match: nothing logged, no mismatch state" || ko "protocol match $(cat "$PT/log")"
+rep ' "apmond_protocol": "2",'; chk; chk; chk
+[ "$(grep -c "^ERR apmond - WARNING node \[ 020000aa0009 \] protocol \[ 2 \] differs from collector protocol \[ 1 \] - upgrade apmond on all nodes" "$PT/log")" -eq 1 ] && [ "$(cat "$PT/run/protocol_mismatch/020000aa0009")" = 2 ] && ok "protocol mismatch: err (syslog + file) logged once only for 3 reports" || ko "protocol mismatch $(cat "$PT/log")"
+: > "$PT/log"; rep ''; chk; chk
+[ "$(grep -c "^ERR .*node \[ 020000aa0009 \] sent no apmond_protocol (protocol 0/unknown)" "$PT/log")" -eq 1 ] && ok "missing apmond_protocol: treated as 0/unknown, warned once" || ko "protocol missing $(cat "$PT/log")"
+chkm() { rm -f "$PT/run/protocol_mismatch/020000aa0009"; hx '{ "System@x": { "node_status": { "mesh11sd_version": "7.3.1", "factory_mac": "x" } } }' > "$PT/rep"; chk; }
+cp "$PT/log" "$PT/log.keep"; : > "$PT/log"; chkm; chkm
+[ "$(grep -c "^DEBUG .*mesh11sd node (no apmond_protocol), treated as protocol \[ 1 \]" "$PT/log")" -eq 1 ] && ! grep -q "^ERR" "$PT/log" && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "mesh11sd-format report (mesh11sd_version, no apmond_protocol): compatible protocol 1, one debug note, no warning" || ko "mesh11sd report $(cat "$PT/log")"
+cp "$PT/log.keep" "$PT/log"; rep ''; chk
+: > "$PT/log"; rep ' "apmond_protocol": "1",'; chk; chk
+[ "$(grep -c "^NOTICE .*node \[ 020000aa0009 \] protocol \[ 1 \] now matches collector protocol \[ 1 \]" "$PT/log")" -eq 1 ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "back in line: notice logged once, mismatch state cleared" || ko "protocol back in line $(cat "$PT/log")"
+[ -z "$(ls "$W/run-R/protocol_mismatch" 2>/dev/null)" ] && ! grep -q "differs from collector protocol" "$W/log" && ok "end to end: same-protocol reports from R and C raise no mismatch" || ko "e2e protocol"
+R status | grep -q '^    "protocol_mismatch_nodes": \[\]$'  && mkdir -p "$W/run-R/protocol_mismatch" && echo 2 > "$W/run-R/protocol_mismatch/020000aa0009" && R status | grep -q '^    "protocol_mismatch_nodes": \["020000aa0009"\]$'  && R status | "$PY" -m json.tool >/dev/null && ok "status: protocol_mismatch_nodes JSON array" || ko "status protocol_mismatch_nodes $(R status | jv protocol_mismatch_nodes)"
+rm -rf "$W/run-R/protocol_mismatch"
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
