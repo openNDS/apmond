@@ -47,7 +47,14 @@ write_to_syslog() {
 		debuglevel=1
 	fi
 
-	entrynum=$((${entrynum:-0} + 1))
+	if [ -n "$entrynum_file" ]; then
+		# daemon: counter shared through the run dir, so log calls in $(...) subshells keep it in step
+		read -r entrynum < "$entrynum_file" 2>/dev/null
+		entrynum=$((${entrynum:-0} + 1))
+		echo "$entrynum" > "$entrynum_file"
+	else
+		entrynum=$((${entrynum:-0} + 1))
+	fi
 
 	case $debugtype in
 		"emerg") debugnum=0; log_to_stderr="-s";;
@@ -689,6 +696,7 @@ ms_to_dt() {
 # Imported from mesh11sd (unchanged except where marked "apmond:")
 #############################################
 get_factory_mac() {
+	# Sets the global factory_mac (no echo: called in the current shell so its log lines keep the entry counter)
 	local mac=""
 
 	# 1. Preferred: Use system function call - sometimes fails and returns a single newline
@@ -697,7 +705,7 @@ get_factory_mac() {
 
 	if [ -n "$mac" ] && [ "$maclen" -eq 17 ]; then
 		log_info "Factory MAC obtained from system function call: $mac"
-		echo "$mac"
+		factory_mac="$mac"
 		return 0
 	fi
 
@@ -707,7 +715,7 @@ get_factory_mac() {
 		mac=$(ip link show "$wan_device" 2>/dev/null | grep -o 'link/ether [^ ]*' | awk '{print $2}')
 		if [ -n "$mac" ]; then
 			log_info "Factory MAC obtained from network.wan.device ($wan_device): $mac"
-			echo "$mac"
+			factory_mac="$mac"
 			return 0
 		fi
 	fi
@@ -717,7 +725,7 @@ get_factory_mac() {
 		mac=$(ip link show "$dev" 2>/dev/null | grep -o 'link/ether [^ ]*' | awk '{print $2}')
 		if [ -n "$mac" ]; then
 			log_info "Factory MAC obtained from fallback interface ($dev): $mac"
-			echo "$mac"
+			factory_mac="$mac"
 			return 0
 		fi
 	done
@@ -726,12 +734,12 @@ get_factory_mac() {
 	mac=$(ip -o link show type ether | head -n1 | awk -F': ' '{print $2}' | awk '{print $2}')
 	if [ -n "$mac" ]; then
 		log_info "Factory MAC obtained from first detected Ethernet interface: $mac"
-		echo "$mac"
+		factory_mac="$mac"
 		return 0
 	fi
 
 	log_warning "Could not determine factory MAC address"
-	echo ""
+	factory_mac=""
 	return 1
 }
 
@@ -741,7 +749,7 @@ write_debug() {
 
 wifi_chipset_detect() {
 	# Attempt to get the label mac
-	labelmac=$(get_factory_mac)
+	get_factory_mac; labelmac="$factory_mac"
 
 	write_debug "labelmac"
 	labelmac="@$labelmac"
@@ -1386,7 +1394,7 @@ get_cached_factory_mac() {
 	if [ -f "$tmpdir/factory_mac" ]; then
 		. "$tmpdir/factory_mac"
 	else
-		factory_mac=$(get_factory_mac)
+		get_factory_mac
 		echo "factory_mac=\"$factory_mac\"" > "$tmpdir/factory_mac"
 	fi
 
@@ -2451,7 +2459,7 @@ run_daemon() {
 	log_datadir
 	last_seed_warning=$(date +%s)
 	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
-	trap 'cleanup_ula; exit 0' INT TERM
+	trap 'cleanup_ula; rm -f "$entrynum_file"; exit 0' INT TERM
 	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc" "$tmpdir/role"
 	outputfile="$tmpdir/wifidetect"
 	wifi_chipset_detect
@@ -2477,6 +2485,14 @@ run_daemon() {
 ##############
 load_config
 
+# Log entry counter: shared through a file so log calls in $(...) subshells keep it in step.
+# The daemon uses $tmpdir/entrynum (reset at start, removed on stop / cleanup); every other invocation
+# (CLI, apmon.cgi) has its own per-process file, starting at [1] as before and removed on exit.
+if [ "$1" != "daemon" ]; then
+	entrynum_file="$tmpdir/entrynum.$$"
+	trap 'rm -f "$entrynum_file"' EXIT
+fi
+
 case "$1" in
 	""|-h|--help|help) show_help;;
 	version) echo "apmond version $version";;
@@ -2486,8 +2502,8 @@ case "$1" in
 	send) send_ap_data; exit $?;;
 	read_log) read_log "$2";;
 	detect) get_router_state; manage_ula; echo "$role";;
-	cleanup) cleanup_ula;;
-	daemon) run_daemon;;
+	cleanup) cleanup_ula; rm -f "$tmpdir/entrynum";;
+	daemon) entrynum_file="$tmpdir/entrynum"; mkdir -p "$tmpdir"; echo 0 > "$entrynum_file"; run_daemon;;
 	write_node_data) write_node_data "$2" "$3"; exit $?;;
 	*) echo "Unknown option [ $1 ]"; show_help; exit 1;;
 esac

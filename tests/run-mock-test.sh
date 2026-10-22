@@ -405,6 +405,18 @@ cp "$PT/log.keep" "$PT/log"; rep ''; chk
 R status | grep -q '^    "protocol_mismatch_nodes": \[\]$'  && mkdir -p "$W/run-R/protocol_mismatch" && echo 2 > "$W/run-R/protocol_mismatch/020000aa0009" && R status | grep -q '^    "protocol_mismatch_nodes": \["020000aa0009"\]$'  && R status | "$PY" -m json.tool >/dev/null && ok "status: protocol_mismatch_nodes JSON array" || ko "status protocol_mismatch_nodes $(R status | jv protocol_mismatch_nodes)"
 rm -rf "$W/run-R/protocol_mismatch"
 
+echo "== 10. Log entry numbers: daemon counter shared with subshells"
+D debuglevel 3 >/dev/null; rm -rf "$W/tmp-D" "$W/run-D"; : > "$W/log"
+MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-D MOCK_IP_DIR=$W/ip-D APMOND_TMPDIR=$W/run-D APMOND_TMP_DATADIR=$W/tmp-D busybox sh $REPO/src/apmond daemon" 2>/dev/null
+nums=$(sed -n 's/.* apmond\[[0-9]*\]: \[\([0-9]*\)\] .*/\1/p' "$W/tmp-D/apmond_log.log")
+n=$(echo "$nums" | wc -l)
+echo "$nums" | awk 'NR==1 && $1!=1 {bad=1} NR>1 && $1<=p {bad=1} {p=$1} END {exit bad}' && [ "$n" -ge 8 ] && grep -q "factory MAC\|Factory MAC" "$W/tmp-D/apmond_log.log" && grep -q "connecting to server" "$W/tmp-D/apmond_log.log" && ok "daemon log entry numbers start at [1], strictly increasing, no duplicates across startup + first send ($n entries)" || ko "entry numbers: $(echo $nums)"
+[ ! -f "$W/run-D/entrynum" ] && ok "shared counter file removed when the daemon stops" || ko "entrynum file left"
+grep -q 'factory_mac=$(get_factory_mac)\|labelmac=$(get_factory_mac)' "$REPO/src/apmond" && ko "get_factory_mac still called in a subshell" || ok "get_factory_mac sets a global, not called in \$(...)"
+: > "$W/tmp-D/apmond_log.log"; D send >/dev/null 2>&1; cn=$(sed -n 's/.* apmond\[[0-9]*\]: \[\([0-9]*\)\] .*/\1/p' "$W/tmp-D/apmond_log.log")
+echo "$cn" | awk 'NR==1 && $1!=1 {bad=1} NR>1 && $1<=p {bad=1} {p=$1} END {exit bad}' && [ -n "$cn" ] && [ -z "$(ls "$W/run-D" | grep entrynum)" ] && ok "CLI has its own counter: starts at [1], no duplicates from subshells, per-process file removed on exit" || ko "CLI counter: $(echo $cn) $(ls "$W/run-D")"
+D debuglevel 1 >/dev/null
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
