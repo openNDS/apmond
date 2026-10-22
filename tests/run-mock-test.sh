@@ -329,6 +329,33 @@ R cleanup; C cleanup
 [ -z "$(grep inet6 "$W/ip-R/addr_apmbr1" "$W/ip-C/addr_apmbr0" 2>/dev/null)" ] && ok "cleanup removed every runtime ULA address" || ko "cleanup"
 ! grep -h "failed to add ULA" "$W"/*log* "$W"/*/apmond/apmond_log.log 2>/dev/null | grep -q . && ok "no 'failed to add ULA address' errors when re-checking addresses (kernel prints canonical form)" || ko "ULA re-add errors: $(grep -rh "failed to add ULA" "$W" 2>/dev/null | head -2)"
 
+echo "== 7. Wired link speed (sysfs / swconfig VLAN / unknown)"
+SW="$W/swmock"; mkdir -p "$SW/bin" "$SW/net/eth0.1" "$SW/net/eth9"
+awk '/^swconfig_vlan_speed\(\) \{/,/^}/; /^get_link_speed\(\) \{/,/^}/' "$REPO/src/apmond" > "$SW/fns.sh"
+cat > "$SW/bin/swconfig" <<'EOS'
+#!/bin/sh
+case "$*" in
+	list) echo "Found: switch0 - mt7628";;
+	"dev switch0 vlan 1 get ports") echo "$SW_V1";;
+	"dev switch0 port 0 get link") echo "$SW_P0";;
+	"dev switch0 port 1 get link") echo "$SW_P1";;
+	"dev switch0 port 2 get link") echo "$SW_P2";;
+	"dev switch0 get arl_table") echo 'Unknown attribute "arl_table"'; exit 1;;
+	*) exit 1;;
+esac
+EOS
+chmod +x "$SW/bin/swconfig"
+echo up > "$SW/net/eth0.1/operstate"; echo down > "$SW/net/eth9/operstate"
+spd() { busybox env PATH="$SW/${3:-bin}:$W/bb" APMOND_SYSFS_NET="$SW/net" SW_V1="$1" SW_P0='port:0 link:up speed:1000baseT full-duplex' SW_P1="$2" SW_P2='port:2 link:down' busybox sh -c ". '$SW/fns.sh'; get_link_speed eth0.1"; }
+[ "$(spd '1 6t' 'port:1 link:up speed:100baseT full-duplex')" = "100" ] && ok "swconfig: single untagged port up -> 100 (CPU 6t dropped)" || ko "swconfig single $(spd '1 6t' 'port:1 link:up speed:100baseT full-duplex')"
+[ "$(spd '1 6t' 'port:1 link:down')" = "down" ] && ok "swconfig: single port link down -> down" || ko "swconfig down"
+[ "$(spd '0 1 2 6t' 'port:1 link:up speed:100baseT full-duplex')" = "1000/100" ] && ok "swconfig: several ports -> up speeds joined (1000/100)" || ko "swconfig multi $(spd '0 1 2 6t' 'port:1 link:up speed:100baseT full-duplex')"
+[ "$(spd '2 6t' x)" = "down" ] && ok "swconfig: no port up -> down" || ko "swconfig none up"
+[ "$(spd '1 6t' x nobin)" = "unknown" ] && ok "no swconfig, VLAN up -> unknown (not down)" || ko "no swconfig $(spd '1 6t' x nobin)"
+echo 100 > "$SW/net/eth0.1/speed"; [ "$(spd '1 6t' 'port:1 link:down')" = "100" ] && ok "sysfs speed wins when present" || ko "sysfs speed"
+echo -1 > "$SW/net/eth0.1/speed"; [ "$(spd '1 6t' 'port:1 link:up speed:100baseT full-duplex')" = "100" ] && ok "sysfs -1 falls back to swconfig" || ko "sysfs -1"
+[ "$(busybox env PATH="$W/bb" APMOND_SYSFS_NET="$SW/net" busybox sh -c ". '$SW/fns.sh'; get_link_speed eth9")" = "down" ] && ok "non-VLAN, operstate down -> down" || ko "operstate down"
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null

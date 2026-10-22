@@ -1647,15 +1647,77 @@ get_ethernet_clients() {
 	rm -f "$tmpdir/fdb"
 }
 
+# swconfig_vlan_speed <vlan id>: speed of the untagged (physical) ports of a swconfig VLAN.
+# One port: its speed or "down". Several ports (no MAC->port map without an ARL table): speeds of up ports joined with "/", or "down".
+swconfig_vlan_speed() {
+	local vid="$1" sw ports p link spd out="" n=0
+
+	command -v swconfig >/dev/null 2>&1 || return 1
+	sw=$(swconfig list 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="Found:") {print $(i+1); exit}}')
+	[ -z "$sw" ] && sw="switch0"
+	ports=$(swconfig dev "$sw" vlan "$vid" get ports 2>/dev/null) || return 1
+
+	for p in $ports; do
+		case "$p" in
+			*t|*[!0-9]*) continue ;;
+		esac
+		n=$((n+1))
+		link=$(swconfig dev "$sw" port "$p" get link 2>/dev/null)
+		case "$link" in
+			*link:up*)
+				spd=$(echo "$link" | sed -n 's/.*speed:\([0-9][0-9]*\).*/\1/p')
+				[ -z "$spd" ] && spd="unknown"
+				out="${out:+$out/}$spd"
+			;;
+		esac
+	done
+
+	[ "$n" -eq 0 ] && return 1
+	[ -z "$out" ] && out="down"
+	echo "$out"
+}
+
+# get_link_speed <iface>: Mb/s, "down" only when the link really is down, "unknown" when it cannot be found
+get_link_speed() {
+	local iface="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" speed oper vid
+
+	speed=$(cat "$sysnet/$iface/speed" 2>/dev/null)
+	if [ -n "$speed" ] && [ "$speed" != "-1" ]; then
+		echo "$speed"
+		return 0
+	fi
+
+	oper=$(cat "$sysnet/$iface/operstate" 2>/dev/null)
+
+	vid=""
+	if [ -r "/proc/net/vlan/$iface" ]; then
+		vid=$(awk '/VID:/ {for(i=1;i<=NF;i++) if ($i=="VID:") {print $(i+1); exit}}' "/proc/net/vlan/$iface" 2>/dev/null)
+	fi
+	if [ -z "$vid" ]; then
+		case "$iface" in
+			*.*) vid="${iface##*.}" ;;
+		esac
+	fi
+	case "$vid" in
+		""|*[!0-9]*) vid="" ;;
+	esac
+
+	if [ -n "$vid" ]; then
+		speed=$(swconfig_vlan_speed "$vid") && [ -n "$speed" ] && { echo "$speed"; return 0; }
+	fi
+
+	[ "$oper" = "down" ] && { echo "down"; return 0; }
+	echo "unknown"
+}
+
 get_eth_stats() {
 	local iface="$1"
 
 	[ -z "$iface" ] && return 1
 	[ ! -d "/sys/class/net/$iface" ] && return 1
 
-	# Link rate (Mb/s). -1 means link down / unknown
-	speed=$(cat "/sys/class/net/$iface/speed" 2>/dev/null)
-	{ [ -z "$speed" ] || [ "$speed" = "-1" ]; } && speed="down"
+	# Link rate (Mb/s): sysfs, else swconfig for VLAN interfaces, else "unknown"
+	speed=$(get_link_speed "$iface")
 
 	# RX / TX bytes from sysfs
 	rx_bytes=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null)
