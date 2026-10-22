@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apmond
 PKG_VERSION:=0.1.0
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 
 PKG_MAINTAINER:=Rob White <rob@blue-wave.net>
 PKG_LICENSE:=GPL-2.0-only
@@ -60,6 +60,16 @@ endef
 
 define Package/apmond/conffiles
 /etc/config/apmond
+endef
+
+define Package/apmond/postinst
+#!/bin/sh
+# Appended after default_postinst, which has already run "/etc/init.d/apmond start".
+# On an upgrade procd ignores that start (same command line), so the old code keeps running: restart it.
+# Fresh install: PKG_UPGRADE is unset, default_postinst started it once. Image build: IPKG_INSTROOT is set.
+if [ -z "$${IPKG_INSTROOT}" ] && [ "$${PKG_UPGRADE}" = "1" ] && /etc/init.d/apmond running; then
+	/etc/init.d/apmond restart
+fi
 endef
 
 define Build/Compile
