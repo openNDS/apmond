@@ -765,6 +765,8 @@ write_debug() {
 wifi_chipset_detect() {
 	# Attempt to get the label mac
 	get_factory_mac; labelmac="$factory_mac"
+	# apmond: no label/factory mac (e.g. x86, VMs): use the device mac, never an empty "System@" key
+	[ -z "$labelmac" ] && { get_device_mac; [ "$device_mac" != "unknown" ] && labelmac="$device_mac"; }
 
 	write_debug "labelmac"
 	labelmac="@$labelmac"
@@ -1380,8 +1382,11 @@ wifi_chipset_detect() {
 	# apmond: only strip the trailing comma if at least one phy was written
 	if [ "$(tail -n 1 "$outputfile")" = "      }," ]; then
 		sed -i '$ s/.$//' "$outputfile"
+		echo "    }" >> "$outputfile"
+	else
+		# no phy: an empty object, written "{}" as jq does
+		sed -i '$ s/{$/{}/' "$outputfile"
 	fi
-	echo "    }" >> "$outputfile"
 	echo "  }" >> "$outputfile"
 	echo "}" >> "$outputfile"
 }
@@ -1982,12 +1987,10 @@ usi_full() {
 		wifi_chipset_detect
 	fi
 
-	# wifidetect ends with "    }\n  }\n}\n" (12 chars) - strip it so we can append to the System object
-	detect=$(cat "$tmpdir/wifidetect")
-	strlen="$((${#detect}))"
-	detect=${detect:0:strlen-12}
-	echo "$detect"
-	echo "    },"
+	# wifidetect ends with the phy object close ("    }" or "    \"phy\": {}") then "  }" and "}":
+	# drop the last two lines and continue the System object after the phy object
+	detect=$(sed '$d' "$tmpdir/wifidetect" | sed '$d')
+	echo "$detect,"
 	get_system_stats_json
 }
 
@@ -2374,6 +2377,10 @@ show_help() {
 	With an argument, set the debuglevel (0 = silent, 1 = notice (default), 2 = info, 3 = debug)
 	The change is committed immediately and applied by the running daemon on its next loop pass (no restart)
 
+  option: get_ap_data
+	Usage: apmond get_ap_data
+	Get json format access point data for this node (as mesh11sd get_ap_data; nothing is sent)
+
   option: send
 	Collect and send access point data to the collector ([<ula>::1]) once
 
@@ -2693,6 +2700,7 @@ case "$1" in
 	status) show_status;;
 	debuglevel) set_debuglevel "$2"; exit $?;;
 	show_ap_data) show_ap_data "$2";;
+	get_ap_data) get_ap_data; exit 0;;
 	send) send_ap_data; exit $?;;
 	read_log) read_log "$2";;
 	detect) get_router_state; manage_ula; echo "$role";;

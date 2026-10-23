@@ -628,6 +628,21 @@ EOP
 { [ -z "$JQ2" ] || "$JQ2" . "$VL/w3.json" | cmp -s - "$VL/w3.json"; } && ok "wireless vlan block byte-identical to jq ." || ko "wireless vlan vs jq"
 vn 'get_station_block phy1-ap0 Guest ""' >/dev/null 2>&1; ! grep -q '"vlan"' "$VL/run/apmond_block" && ok "no vlan key on wireless entries when the AP has no VLAN" || ko "wireless vlan without vid"
 
+echo "== 15d. apmond get_ap_data (as mesh11sd get_ap_data, prints this node's data, sends nothing)"
+RD=$(R status | jv ap_data_dir); [ -n "$(ls "$RD" 2>/dev/null)" ] && ok "collector data dir has data before get_ap_data (non-vacuous check)" || ko "collector data dir $RD empty"
+snap() { { ls -l --full-time "$RD"; cat "$W"/run-C/last_send "$W"/run-R/last_send 2>/dev/null; md5sum "$RD"/* 2>/dev/null; } | md5sum; }
+B=$(snap); C get_ap_data > "$W/gad-C.json" 2>"$W/gad-C.err"; RC=$?; R get_ap_data > "$W/gad-R.json" 2>/dev/null
+[ "$RC" -eq 0 ] && [ ! -s "$W/gad-C.err" ] && json_ok < "$W/gad-C.json" && json_ok < "$W/gad-R.json" && ok "get_ap_data runs on peer and router: valid JSON, no stderr" || ko "get_ap_data: rc $RC $(head -3 "$W/gad-C.err")"
+"$PY" - "$W/gad-C.json" "$CID" <<'EOP' && ok "get_ap_data shape: { System@<mac>: { ..., node_status, clients@<mac> } } like mesh11sd" || ko "get_ap_data shape"
+import json,sys
+d=json.load(open(sys.argv[1])); k=list(d); assert len(k)==1 and k[0].startswith("System@"), k
+v=d[k[0]]; m=k[0][7:]; assert "node_status" in v and ("clients@"+m) in v, list(v)
+EOP
+{ [ -z "$JQ2" ] || { "$JQ2" . "$W/gad-C.json" | cmp -s - "$W/gad-C.json" && "$JQ2" . "$W/gad-R.json" | cmp -s - "$W/gad-R.json"; }; } && ok "get_ap_data output byte-identical to jq ." || ko "get_ap_data vs jq"
+[ "$B" = "$(snap)" ] && ok "get_ap_data sent nothing (collector data and last_send unchanged)" || ko "get_ap_data changed collector data / last_send"
+! ls "$W"/run-C/entrynum.* >/dev/null 2>&1 && [ ! -e "$W/run-C/apmond/clients.loc" ] && ok "get_ap_data: per-pid log counter removed, no lock left" || ko "get_ap_data leftovers"
+C help | grep -q 'option: get_ap_data' && C help | grep -q 'Usage: apmond get_ap_data' && ok "get_ap_data in help" || ko "help get_ap_data"
+
 echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
 ! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"
 awk '/^daemon_pid\(\) \{/,/^}/' "$REPO/src/apmond" > "$W/dpid.sh"

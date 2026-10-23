@@ -27,6 +27,9 @@ for LuCI to pick up.
 1. Install the package on every node.
 2. On every node: `uci set apmond.setup.apmon_seed='my private passphrase'; uci commit apmond; service apmond restart`
 3. On the router: `apmond show_ap_data` / `apmond show_ap_data all`. `apmond status` on any node shows its role.
+   `apmond get_ap_data` on any node (router or peer) prints that node's own current access point data as JSON
+   (the same `System@<mac>` document it would send, as mesh11sd `get_ap_data`) without sending anything;
+   it prints nothing when the node has no clients.
 
 `apmond status` reports `checksum` (sha256 of the script the running daemon started from, or of
 `/usr/sbin/apmond` when no daemon runs) and `installed_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
