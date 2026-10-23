@@ -63,6 +63,7 @@ Implications:
 - Mixed versions can appear anywhere, so the protocol check must warn rather than reject, which is what r9 does.
 - Each island, or cabled group, must still reach the one collector ULA over the bridge. Role detection (router or collector, versus AP) must cope with several cabled paths and must not let an island elect its own collector unless that is intended.
 - Wired clients may be seen through several bridges. `bridge` is already a UCI list in ApmonD, and from r14 the default (unset or `'auto'`) scans every non-WAN bridge, as mesh11sd's `get_ethernet_clients` already does (all bridges from `brctl show`, ports from UCI, `vxlan` ports skipped).
+- Wired client entries (ApmonD from r17): every non-local MAC on a bridge port is listed, including other APs and mesh nodes, exactly as mesh11sd's `get_ethernet_clients` does (`brctl showmacs` "is local? no", no peer filtering). `rx_bytes`/`tx_bytes` are the port totals and `rx_bitrate`/`tx_bitrate` the port link speed, shared by all MACs on that port, in both implementations. ApmonD adds `"stats_scope": "port"` after `tx_bitrate`; all other keys are unchanged. mesh11sd will add the same key later; until then a collector must treat a wired entry with no `stats_scope` as `"port"`.
 - Speed reporting must work on both swconfig and DSA switches. ApmonD r5 handles swconfig VLAN ports, and mesh11sd still needs the same fix.
 
 ## Open questions

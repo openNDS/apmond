@@ -44,6 +44,14 @@ bridges with no members other than a mesh11sd `vxlan` tunnel port. Wireless port
 station dump and `vxlan` ports are never scanned (their MACs are other nodes' clients). To scan only
 particular bridges, list them: `list bridge 'br-lan'`. The ULA addresses stay on `device` only.
 
+Every MAC learned on a wired bridge port is listed under `<port>@<bridge>`, including other APs and mesh
+nodes (several APs can share a port); they are ordinary devices, as in mesh11sd. The bridge does not count
+traffic per MAC, so a wired entry's `rx_bytes` / `tx_bytes` are the port's totals and `rx_bitrate` /
+`tx_bitrate` its link speed (Mb/s), shared by every MAC on that port. Each wired entry says so with
+`"stats_scope": "port"`. Wireless station entries are per station and have no `stats_scope`. A collector
+should treat a wired entry without `stats_scope` (e.g. from a mesh11sd version that does not add it yet)
+as `"port"`.
+
 Upgrading: if your `/etc/config/apmond` has been changed (e.g. by `apmond debuglevel`), apk keeps it and
 installs the new default beside it as `/etc/config/apmond.apk-new`; compare the two to see new option comments.
 

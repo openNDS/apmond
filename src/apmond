@@ -1708,6 +1708,7 @@ get_ethernet_clients() {
 				echo "          \"tx_bytes\": \"$tx_bytes\"," >> "$tmpdir/apmond_block"
 				echo "          \"rx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
 				echo "          \"tx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
+				echo "          \"stats_scope\": \"port\"," >> "$tmpdir/apmond_block"
 				echo "          \"timestamp\": \"$timestamp\"," >> "$tmpdir/apmond_block"
 				echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
 				echo "        }," >> "$tmpdir/apmond_block"
