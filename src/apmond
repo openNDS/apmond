@@ -20,6 +20,12 @@
 version="0.1.0"
 protocol_version="1"
 
+# sha256 of the running script, computed once per invocation (as mesh11sd: checksum=$(sha256sum /usr/sbin/mesh11sd ...)).
+# Reported as node_status.apmond_checksum (mesh11sd: mesh11sd_checksum) and status "checksum".
+apmond_script="/usr/sbin/apmond"
+[ -f "$apmond_script" ] || apmond_script="$0"
+checksum=$(sha256sum "$apmond_script" 2>/dev/null | awk '{printf "%s", $1}')
+
 # Volatile runtime state: /var/run/apmond (= /tmp/run/apmond on OpenWrt; mesh11sd/procd use /var/run)
 tmpdir="${APMOND_TMPDIR:-/var/run/apmond}"
 outputfile="$tmpdir/wifidetect"
@@ -1789,6 +1795,7 @@ get_system_stats_json() {
 	echo "    \"node_status\": {"
 	echo "      \"apmond_version\": \"$version\","
 	echo "      \"apmond_protocol\": \"$protocol_version\","
+	echo "      \"apmond_checksum\": \"$checksum\","
 	echo "      \"factory_mac\": \"$factory_mac\","
 	echo "      \"device_mac\": \"$device_mac\","
 	echo "      \"uptime_seconds\": ${uptime_sec:-0},"
@@ -2317,6 +2324,7 @@ show_status() {
 	echo "  \"apmond_status\": {"
 	echo "    \"apmond_version\": \"$(json_str "$version")\","
 	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
+	echo "    \"checksum\": \"$checksum\","
 	echo "    \"enabled\": \"$(json_str "$enabled")\","
 	echo "    \"daemon_running\": \"$running\","
 	echo "    \"daemon_pid\": \"${pid:-none}\","

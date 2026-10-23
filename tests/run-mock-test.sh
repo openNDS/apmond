@@ -417,6 +417,12 @@ grep -q 'factory_mac=$(get_factory_mac)\|labelmac=$(get_factory_mac)' "$REPO/src
 echo "$cn" | awk 'NR==1 && $1!=1 {bad=1} NR>1 && $1<=p {bad=1} {p=$1} END {exit bad}' && [ -n "$cn" ] && [ -z "$(ls "$W/run-D" | grep entrynum)" ] && ok "CLI has its own counter: starts at [1], no duplicates from subshells, per-process file removed on exit" || ko "CLI counter: $(echo $cn) $(ls "$W/run-D")"
 D debuglevel 1 >/dev/null
 
+echo "== 11. Script checksum (as mesh11sd checksum / mesh11sd_checksum)"
+SUM=$(sha256sum "$REPO/src/apmond" | awk '{print $1}')
+[ "$(R status | jv checksum)" = "$SUM" ] && R status | json_ok && ok "status JSON includes checksum = sha256 of the script" || ko "status checksum $(R status | jv checksum)"
+C send >/dev/null 2>&1; R show_ap_data "$CID" > "$W/ck.json"; json_ok < "$W/ck.json" && grep -q "^ *\"apmond_checksum\": \"$SUM\",$" "$W/ck.json" && ok "show_ap_data node_status includes apmond_checksum" || ko "node_status apmond_checksum"
+[ "$(grep -c 'sha256sum "$apmond_script"' "$REPO/src/apmond")" -eq 1 ] && ok "script hashed once per invocation (top level only)" || ko "checksum computed more than once"
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null
