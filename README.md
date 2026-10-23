@@ -73,6 +73,13 @@ The bridge keeps one fdb entry per MAC and VLAN, but a JSON key can't repeat, so
 and a MAC seen in several VLANs gets its VIDs comma-joined in ascending order, e.g. `"vlan": "10,20"`. On a
 bridge without vlan_filtering the key is never present.
 
+Wireless client entries get the same optional `"vlan": "<vid>"`, after `connected_time` and before
+`timestamp`, worked out per AP interface: if the wifi-iface's `option network` (e.g. `guest`) has a device
+`<bridge>.<N>` (e.g. `br-lan.20`) on a vlan_filtering bridge, the VID is N; otherwise, if the AP interface
+is a port of a vlan_filtering bridge with a single untagged VLAN in its UCI `bridge-vlan` sections, that VID.
+Without vlan_filtering the key is omitted. Only `mode 'ap'` wifi-ifaces are reported, never the mesh
+interface. No ip-bridge needed.
+
 Upgrading: if your `/etc/config/apmond` has been changed (e.g. by `apmond debuglevel`), apk keeps it and
 installs the new default beside it as `/etc/config/apmond.apk-new`; compare the two to see new option comments.
 

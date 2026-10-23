@@ -506,7 +506,7 @@ network.trunk.device='br-lan'
 network.trunk.proto='none'
 EOS
 echo "apmond.setup=apmond" > "$VL/uci/apmond"
-awk '/^(get_option|resolve_id_device|port_access_vlan|get_bridge_fdb|wan_devices|detect_bridges|get_ethernet_clients|get_eth_stats|get_link_speed|swconfig_vlan_speed|append_block|log_debug)\(\) \{/,/^}/' "$REPO/src/apmond" > "$VL/fns.sh"
+awk '/^(get_option|resolve_id_device|port_access_vlan|ap_vlan|get_station_block|ms_to_dt|get_bridge_fdb|wan_devices|detect_bridges|get_ethernet_clients|get_eth_stats|get_link_speed|swconfig_vlan_speed|append_block|log_debug)\(\) \{/,/^}/' "$REPO/src/apmond" > "$VL/fns.sh"
 vl() { busybox env PATH="$VL/bin:$W/mock:$W/bb" MOCK_UCI_DIR="$VL/uci" APMOND_SYSFS_NET="$N" busybox sh -c "bridge_auto=1; bridge_list=''; tmpdir='$VL/run'; . '$VL/fns.sh'; $1"; }
 [ "$(vl 'resolve_id_device; echo $id_device $id_bridge')" = "br-lan.10 br-lan" ] && ok "vlan_filtering br-lan: id device = network.lan.device br-lan.10, parent bridge br-lan" || ko "resolve: $(vl 'resolve_id_device; echo $id_device $id_bridge')"
 echo "apmond.setup.device='br-lan.10'" >> "$VL/uci/apmond"
@@ -578,6 +578,55 @@ EOP
 { [ -z "$JQ2" ] || "$JQ2" . "$VL/w2.json" | cmp -s - "$VL/w2.json"; } && ok "UCI vlan clients block byte-identical to jq ." || ko "uci vlan block vs jq"
 rm -f "$VL/run/apmond/clients"; vl 'resolve_id_device; bridge_auto=0; bridge_list=br-lan; first_block=1; eth_sta=0; get_ethernet_clients' >/dev/null 2>&1
 grep -A6 '"02:aa:00:00:00:01"' "$VL/run/apmond/clients" | grep -q '"vlan": "10,20"' && ok "bridge command present: per-MAC fdb VIDs override the UCI access VLAN" || ko "fdb override: $(cat "$VL/run/apmond/clients")"
+
+echo "== 15c. VLAN of wireless clients (AP iface network device br-lan.N, or untagged bridge-vlan port)"
+mkdir -p "$N/phy0-ap0" "$N/phy1-ap0" "$N/phy0-ap1" "$N/br-lan/brif/phy1-ap0" "$N/br-plain/brif/phy0-ap1"
+ln -sfn ../br-lan "$N/phy1-ap0/master"; ln -sfn ../br-plain "$N/phy0-ap1/master"
+cat >> "$VL/uci/network" <<'EOS'
+network.plain=interface
+network.plain.device='br-plain'
+network.@bridge-vlan[3]=bridge-vlan
+network.@bridge-vlan[3].device='br-lan'
+network.@bridge-vlan[3].vlan='30'
+network.@bridge-vlan[3].ports='phy1-ap0:u*'
+EOS
+cat > "$VL/uci/wireless" <<'EOS'
+wireless.default_radio0=wifi-iface
+wireless.default_radio0.mode='ap'
+wireless.default_radio0.ssid='Home'
+wireless.default_radio0.network='lan'
+wireless.guest=wifi-iface
+wireless.guest.mode='ap'
+wireless.guest.ssid='Guest'
+wireless.guest.network='guest'
+wireless.trunkap=wifi-iface
+wireless.trunkap.mode='ap'
+wireless.trunkap.ssid='Trunk'
+wireless.trunkap.network='trunk'
+wireless.plainap=wifi-iface
+wireless.plainap.mode='ap'
+wireless.plainap.ssid='Plain'
+wireless.plainap.network='plain'
+wireless.mesh0=wifi-iface
+wireless.mesh0.mode='mesh'
+wireless.mesh0.network='trunk'
+EOS
+[ "$(vn 'ap_vlan default_radio0 phy0-ap0')" = 10 ] && [ "$(vn 'ap_vlan guest phy0-ap1x')" = 20 ] && ok "AP iface vlan from its network device (lan br-lan.10 -> 10, guest br-lan.20 -> 20)" || ko "ap_vlan network: $(vn 'ap_vlan default_radio0 phy0-ap0') $(vn 'ap_vlan guest x')"
+[ "$(vn 'ap_vlan trunkap phy1-ap0')" = 30 ] && ok "AP iface on br-lan itself: untagged PVID port in bridge-vlan -> 30" || ko "ap_vlan bridge-vlan port: $(vn 'ap_vlan trunkap phy1-ap0')"
+[ -z "$(vn 'ap_vlan plainap phy0-ap1')" ] && ok "no vlan for an AP on a bridge without vlan_filtering" || ko "ap_vlan plain"
+APL=$(grep -m1 '^	aplist=' "$REPO/src/apmond" | sed 's/^	aplist=//')
+[ "$(vn "echo $APL")" = "default_radio0 guest trunkap plainap" ] && ok "mesh wifi-iface (mode mesh) never reported as a client AP" || ko "aplist: $(vn "echo $APL")"
+vn 'get_station_block phy1-ap0 Guest 20' >/dev/null 2>&1
+{ printf '{\n  "s": {\n    "c": {\n'; cat "$VL/run/apmond_block"; printf '    }\n  }\n}\n'; } > "$VL/w3.json"
+"$PY" - "$VL/w3.json" <<'EOP' && ok "wireless entry: whitelisted keys kept, vlan after connected_time and before timestamp" || ko "wireless vlan: $(cat "$VL/w3.json")"
+import json,sys
+d=json.load(open(sys.argv[1]))["s"]["c"]["Guest@phy1-ap0"]
+e=list(d.values())[0]
+assert list(e)==["rx_bytes","tx_bytes","tx_retries","signal_avg","tx_bitrate","rx_bitrate","avg_ack_signal","connected_time","vlan","timestamp","date_time"], list(e)
+assert e["vlan"]=="20"
+EOP
+{ [ -z "$JQ2" ] || "$JQ2" . "$VL/w3.json" | cmp -s - "$VL/w3.json"; } && ok "wireless vlan block byte-identical to jq ." || ko "wireless vlan vs jq"
+vn 'get_station_block phy1-ap0 Guest ""' >/dev/null 2>&1; ! grep -q '"vlan"' "$VL/run/apmond_block" && ok "no vlan key on wireless entries when the AP has no VLAN" || ko "wireless vlan without vid"
 
 echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
 ! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"

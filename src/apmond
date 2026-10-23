@@ -1446,11 +1446,35 @@ get_ap_ifname() {
 	echo "$name"
 }
 
+# ap_vlan <wifi-iface section> <ifname>: VID of an AP interface on a vlan_filtering bridge, "" otherwise.
+# 1. the iface's option network (e.g. guest) has device <bridge>.<N> (br-lan.20) on a vlan_filtering bridge -> N
+# 2. else the ifname is a port of a vlan_filtering bridge with a single untagged VLAN in UCI bridge-vlan
+ap_vlan() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" net dev br vid master
+
+	for net in $(uci -q get wireless."$1".network); do
+		dev=$(uci -q get network."$net".device)
+		case "$dev" in
+			*.*)
+				br=${dev%.*}; vid=${dev##*.}
+				case "$vid" in ''|*[!0-9]*) continue ;; esac
+				[ "$(cat "$sysnet/$br/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && { echo "$vid"; return 0; }
+			;;
+		esac
+	done
+
+	master=$(readlink "$sysnet/$2/master" 2>/dev/null)
+	master=${master##*/}
+	[ -n "$master" ] && [ "$(cat "$sysnet/$master/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_access_vlan "$master" "$2"
+	return 0
+}
+
 get_station_block() {
 	# Parse "iw dev <ifname> station dump" into the mesh11sd apmond JSON format
 	# $1 = ap_ifname, $2 = ap_ssid. Output appended to $tmpdir/apmond_block
 	local ap_ifname="$1"
 	local ap_ssid="$2"
+	local ap_vid="$3"
 
 	iw dev "$ap_ifname" station dump 2>/dev/null > "$tmpdir/stations"
 
@@ -1481,6 +1505,7 @@ get_station_block() {
 				;;
 				"current_time")
 					ap_param_str=$(echo -n "$ap_param_str" | sed s/current_time/timestamp/g)
+					[ -n "$ap_vid" ] && echo "          \"vlan\": \"$ap_vid\"," >> "$tmpdir/apmond_block"
 					echo "          $ap_param_str," >> "$tmpdir/apmond_block"
 					ms_to_dt "$ap_param_str"
 					echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
@@ -1550,7 +1575,7 @@ get_ap_data() {
 			continue
 		fi
 
-		if get_station_block "$ap_ifname" "$ap_ssid"; then
+		if get_station_block "$ap_ifname" "$ap_ssid" "$(ap_vlan "$ap" "$ap_ifname")"; then
 			ap_sta=1
 			append_block
 		fi
