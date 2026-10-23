@@ -532,6 +532,14 @@ JQ2=$(PATH="$SPATH" command -v jq || true); { printf '{\n  "s": {\n    "c": {\n'
 { [ -z "$JQ2" ] || "$JQ2" . "$VL/w.json" | cmp -s - "$VL/w.json"; } && ok "vlan clients block byte-identical to jq . (${JQ2:-jq not installed, skipped})" || ko "vlan block vs jq: $("$JQ2" . "$VL/w.json" | diff - "$VL/w.json" | head)"
 ! grep -q '"vlan"' "$W/report.json" && ok "no vlan key for wired clients on a non-filtering bridge (apmbr0)" || ko "vlan key on plain bridge"
 
+echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
+! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"
+awk '/^daemon_pid\(\) \{/,/^}/' "$REPO/src/apmond" > "$W/dpid.sh"
+( i=0; while [ $i -lt 400 ]; do busybox true; i=$((i+1)); done ) & CH=$!
+: > "$W/dpid.err"; i=0; while [ $i -lt 30 ]; do busybox sh -c ". '$W/dpid.sh'; daemon_pid" >/dev/null 2>>"$W/dpid.err"; i=$((i+1)); done
+wait $CH 2>/dev/null
+[ ! -s "$W/dpid.err" ] && ok "daemon_pid /proc scan silent while processes exit mid-scan" || ko "daemon_pid stderr: $(head -3 "$W/dpid.err")"
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null

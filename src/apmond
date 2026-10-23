@@ -55,7 +55,7 @@ write_to_syslog() {
 
 	if [ -n "$entrynum_file" ]; then
 		# daemon: counter shared through the run dir, so log calls in $(...) subshells keep it in step
-		[ -f "$entrynum_file" ] && read -r entrynum < "$entrynum_file"
+		[ -f "$entrynum_file" ] && { read -r entrynum < "$entrynum_file"; } 2>/dev/null
 		entrynum=$((${entrynum:-0} + 1))
 		echo "$entrynum" > "$entrynum_file"
 	else
@@ -110,7 +110,7 @@ write_log() {
 
 	# Truncate the log file to max_log_entries lines
 	log_entries=0
-	[ -f "$logfile" ] && log_entries=$(wc -l < "$logfile")
+	[ -f "$logfile" ] && log_entries=$({ wc -l < "$logfile"; } 2>/dev/null)
 	is_uint "$log_entries" || log_entries=0
 
 	if [ "$log_entries" -gt "$max_log_entries" ]; then
@@ -1133,7 +1133,7 @@ wifi_chipset_detect() {
 
 		# Broadcom brcmfmac
 		if [ -z "$chipset" ] && echo "$driver" | grep -q brcmfmac; then
-			modalias=$(tr '\0' '\n' < "$dir/device/modalias" 2>/dev/null)
+			modalias=$({ tr '\0' '\n' < "$dir/device/modalias"; } 2>/dev/null)
 			broadcom_modalias="$modalias"
 			write_debug "broadcom_modalias"
 			fw=$(ls "$dir"/device/firmware/*/brcmfmac* 2>/dev/null | head -n1 | xargs basename 2>/dev/null || true)
@@ -1155,7 +1155,7 @@ wifi_chipset_detect() {
 
 		# MediaTek Filogic / mt79xx family – now includes MT7996 Wi-Fi 7
 		if [ -z "$chipset" ] && [ -f "$dir/device/modalias" ]; then
-			modalias=$(tr '\0' '\n' < "$dir/device/modalias" 2>/dev/null)
+			modalias=$({ tr '\0' '\n' < "$dir/device/modalias"; } 2>/dev/null)
 
 			if echo "$modalias" | grep -iq 'mt79'; then
 				filogic_modalias="$modalias"
@@ -2434,7 +2434,8 @@ daemon_pid() {
 	local d cmd
 	for d in /proc/[0-9]*; do
 		[ "${d#/proc/}" = "$$" ] && continue
-		cmd=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null)
+		# the pid may exit between the glob and the read: the group redirect also silences ash's "can't open"
+		cmd=$({ tr '\000' ' ' < "$d/cmdline"; } 2>/dev/null)
 		case "$cmd" in
 			*apmond\ daemon*) echo "${d#/proc/}"; return 0 ;;
 		esac
@@ -2457,7 +2458,7 @@ show_status() {
 	# checksum: the running daemon's own hash (written at daemon start); the script's hash when no daemon runs.
 	# installed_checksum: sha256 of /usr/sbin/apmond as installed on disk now. They differ after an upgrade without a restart.
 	running_checksum="$checksum"
-	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && read -r running_checksum < "$tmpdir/daemon_checksum"
+	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && { read -r running_checksum < "$tmpdir/daemon_checksum"; } 2>/dev/null
 	echo "    \"checksum\": \"$(json_str "$running_checksum")\","
 	echo "    \"installed_checksum\": \"$checksum\","
 	[ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ] && echo "    \"checksum_warning\": \"running daemon differs from /usr/sbin/apmond - restart apmond\","
