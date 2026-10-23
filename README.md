@@ -9,7 +9,9 @@ Every node (access points and the router) runs the same daemon with an identical
 are derived from one memorable passphrase (`apmon_seed`). The node with an upstream wan gateway
 detects itself as the router, takes `<ula_prefix>:<subnet>::1` at runtime and becomes the
 collector; every node sends its report there. Addresses are applied with `ip` at runtime and
-removed on stop. Nothing is ever written to UCI.
+removed on stop; they are never written to UCI. ApmonD never leaves uncommitted UCI changes: a
+CLI setting such as `apmond debuglevel <n>` is committed straight away, so nothing is left pending
+for LuCI to pick up.
 
 ## Features
 
