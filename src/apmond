@@ -1474,7 +1474,7 @@ get_station_block() {
 					ap_param_str=$(echo -n "$ap_param_str" | sed s/current_time/timestamp/g)
 					echo "          $ap_param_str," >> "$tmpdir/apmond_block"
 					ms_to_dt "$ap_param_str"
-					echo "          \"date_time\":\"$date_time\"" >> "$tmpdir/apmond_block"
+					echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
 					echo "        }," >> "$tmpdir/apmond_block"
 				;;
 			esac
@@ -1647,7 +1647,7 @@ get_ethernet_clients() {
 				echo "          \"tx_bytes\": \"$tx_bytes\"," >> "$tmpdir/apmond_block"
 				echo "          \"rx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
 				echo "          \"tx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
-				echo "          \"timestamp\":\"$timestamp\"," >> "$tmpdir/apmond_block"
+				echo "          \"timestamp\": \"$timestamp\"," >> "$tmpdir/apmond_block"
 				echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
 				echo "        }," >> "$tmpdir/apmond_block"
 			done
@@ -2299,6 +2299,23 @@ json_str() {
 	printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+# json_array <indent> <items...>: prints a JSON array body the way jq . does: "[]" if empty, otherwise
+# "[", one element per line indented <indent>+2 spaces, and "]" at <indent> (caller prints key and trailing comma)
+json_array() {
+	local ind="$1" sep="" it
+	shift
+	if [ "$#" -eq 0 ]; then
+		printf '[]'
+		return 0
+	fi
+	printf '['
+	for it in "$@"; do
+		printf '%s\n%s  "%s"' "$sep" "$ind" "$(json_str "$it")"
+		sep=","
+	done
+	printf '\n%s]' "$ind"
+}
+
 # daemon_pid: pid of a running "apmond daemon" (BusyBox: scan /proc)
 daemon_pid() {
 	local d cmd
@@ -2343,13 +2360,9 @@ show_status() {
 		echo "    \"collector\": \"$(json_str "$router_ula")\","
 		echo "    \"device\": \"$(json_str "$id_device")\","
 		echo "    \"ap_mac_id\": \"$(json_str "$device_mac")\","
-		printf '    "bridges": ['
-		sep=""
-		for b in $bridges; do
-			printf '%s"%s"' "$sep" "$(json_str "$b")"
-			sep=", "
-		done
-		echo "],"
+		printf '    "bridges": '
+		json_array "    " $bridges
+		echo ","
 		echo "    \"role\": \"$(json_str "${role:-unknown (daemon not run yet)}")\","
 		echo "    \"role_reason\": \"$(json_str "${role_reason:-none}")\","
 		echo "    \"node_ula\": \"$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")\","
@@ -2363,13 +2376,8 @@ show_status() {
 			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base:" '$1=="inet6" && index($2,p)==1 {print $2}')
 			[ "$first" -eq 1 ] || echo ","
 			first=0
-			printf '      "%s": [' "$(json_str "$i")"
-			sep=""
-			for a in $addrs; do
-				printf '%s"%s"' "$sep" "$(json_str "$a")"
-				sep=", "
-			done
-			printf ']'
+			printf '      "%s": ' "$(json_str "$i")"
+			json_array "      " $addrs
 		done
 		echo
 		echo "    },"
@@ -2396,10 +2404,9 @@ show_status() {
 	fi
 	echo "    \"runtime_dir\": \"$(json_str "$tmpdir")\","
 	echo "    \"access_points_with_data\": \"$aps\","
-	printf '    "protocol_mismatch_nodes": ['
-	sep=""
-	for b in $(ls "$tmpdir/protocol_mismatch/" 2>/dev/null); do printf '%s"%s"' "$sep" "$(json_str "$b")"; sep=", "; done
-	echo "]"
+	printf '    "protocol_mismatch_nodes": '
+	json_array "    " $(ls "$tmpdir/protocol_mismatch/" 2>/dev/null)
+	echo
 	echo "  }"
 	echo "}"
 }

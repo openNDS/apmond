@@ -402,7 +402,7 @@ cp "$PT/log.keep" "$PT/log"; rep ''; chk
 : > "$PT/log"; rep ' "apmond_protocol": "1",'; chk; chk
 [ "$(grep -c "^NOTICE .*node \[ 020000aa0009 \] protocol \[ 1 \] now matches collector protocol \[ 1 \]" "$PT/log")" -eq 1 ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "back in line: notice logged once, mismatch state cleared" || ko "protocol back in line $(cat "$PT/log")"
 [ -z "$(ls "$W/run-R/protocol_mismatch" 2>/dev/null)" ] && ! grep -q "differs from collector protocol" "$W/log" && ok "end to end: same-protocol reports from R and C raise no mismatch" || ko "e2e protocol"
-R status | grep -q '^    "protocol_mismatch_nodes": \[\]$'  && mkdir -p "$W/run-R/protocol_mismatch" && echo 2 > "$W/run-R/protocol_mismatch/020000aa0009" && R status | grep -q '^    "protocol_mismatch_nodes": \["020000aa0009"\]$'  && R status | "$PY" -m json.tool >/dev/null && ok "status: protocol_mismatch_nodes JSON array" || ko "status protocol_mismatch_nodes $(R status | jv protocol_mismatch_nodes)"
+R status | grep -q '^    "protocol_mismatch_nodes": \[\]$'  && mkdir -p "$W/run-R/protocol_mismatch" && echo 2 > "$W/run-R/protocol_mismatch/020000aa0009" && R status | grep -A2 '^    "protocol_mismatch_nodes": \[$' | tr -d '\n' | grep -q '^    "protocol_mismatch_nodes": \[      "020000aa0009"    \]$' && R status | "$PY" -m json.tool >/dev/null && ok "status: protocol_mismatch_nodes JSON array" || ko "status protocol_mismatch_nodes $(R status | jv protocol_mismatch_nodes)"
 rm -rf "$W/run-R/protocol_mismatch"
 
 echo "== 10. Log entry numbers: daemon counter shared with subshells"
@@ -422,6 +422,23 @@ SUM=$(sha256sum "$REPO/src/apmond" | awk '{print $1}')
 [ "$(R status | jv checksum)" = "$SUM" ] && R status | json_ok && ok "status JSON includes checksum = sha256 of the script" || ko "status checksum $(R status | jv checksum)"
 C send >/dev/null 2>&1; R show_ap_data "$CID" > "$W/ck.json"; json_ok < "$W/ck.json" && grep -q "^ *\"apmond_checksum\": \"$SUM\",$" "$W/ck.json" && ok "show_ap_data node_status includes apmond_checksum" || ko "node_status apmond_checksum"
 [ "$(grep -c 'sha256sum "$apmond_script"' "$REPO/src/apmond")" -eq 1 ] && ok "script hashed once per invocation (top level only)" || ko "checksum computed more than once"
+
+echo "== 12. JSON output formatted as jq . (arrays one element per line, empty [] kept)"
+JQ=$(command -v jq || true)
+jqsame() { [ -z "$JQ" ] && return 0; "$JQ" . "$1" > "$1.jq" 2>/dev/null && cmp -s "$1" "$1.jq"; }
+R detect >/dev/null; R status > "$W/st.json"; jqsame "$W/st.json" && ok "status output byte-identical to jq . (${JQ:-jq not installed, skipped})" || ko "status vs jq: $(diff "$W/st.json" "$W/st.json.jq" | head -20)"
+C status > "$W/stc.json"; jqsame "$W/stc.json" && ok "peer status output byte-identical to jq ." || ko "peer status vs jq: $(diff "$W/stc.json" "$W/stc.json.jq" | head -20)"
+grep -q '^    "protocol_mismatch_nodes": \[\]' "$W/st.json" && ok "empty array stays [] as in jq" || ko "empty array"
+grep -A1 '^      "[^"]*": \[$' "$W/st.json" | grep -q '^        "fd' && ok "ula_addresses list: one address per line, indented one level deeper" || ko "ula_addresses layout $(grep -A3 ula_addresses "$W/st.json")"
+mkdir -p "$W/run-R/protocol_mismatch"; echo 2 > "$W/run-R/protocol_mismatch/020000aa0009"; echo 0 > "$W/run-R/protocol_mismatch/020000aa000a"
+R status > "$W/st2.json"; jqsame "$W/st2.json" && [ "$(R status | jv protocol_mismatch_nodes)" = "020000aa0009 020000aa000a" ] && ok "2-element array matches jq ." || ko "2 elem vs jq: $(diff "$W/st2.json" "$W/st2.json.jq")"
+rm -rf "$W/run-R/protocol_mismatch"
+C send >/dev/null 2>&1; R show_ap_data "$CID" > "$W/sd.json"; jqsame "$W/sd.json" && ok "show_ap_data <mac> (stored report, node_status, Bands/Standards) byte-identical to jq ." || ko "show_ap_data vs jq: $(diff "$W/sd.json" "$W/sd.json.jq" | head -20)"
+R show_ap_data all > "$W/sa.json"; jqsame "$W/sa.json" && ok "show_ap_data all byte-identical to jq ." || ko "show_ap_data all vs jq: $(diff "$W/sa.json" "$W/sa.json.jq" | head -20)"
+grep -q '"[a-z_]*":[^ ]' "$W/sd.json" && ko "key without space after colon" || ok "every key printed as \"key\": value"
+
+rm -rf "$PT/run/protocol_mismatch"; : > "$PT/log"; rep ' "Bands": ["2.4GHz","5GHz"], "apmond_protocol": "1",'; chk; [ ! -s "$PT/log" ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "older report with inline arrays: protocol still read, no mismatch" || ko "inline array report $(cat "$PT/log")"
+hx "$(printf '{\n  "System@x": {\n    "Bands": [\n      "2.4GHz"\n    ],\n    "node_status": {\n      "apmond_protocol": "1",\n      "f": "x"\n    }\n  }\n}')" > "$PT/rep"; : > "$PT/log"; chk; [ ! -s "$PT/log" ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "jq-style multi-line report: protocol read, no mismatch" || ko "multiline report $(cat "$PT/log")"
 
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
