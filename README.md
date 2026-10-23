@@ -52,6 +52,23 @@ traffic per MAC, so a wired entry's `rx_bytes` / `tx_bytes` are the port's total
 should treat a wired entry without `stats_scope` (e.g. from a mesh11sd version that does not add it yet)
 as `"port"`.
 
+## VLAN-aware bridges (vlan_filtering)
+
+A bridge with `option vlan_filtering '1'` (e.g. home and guest VLANs trunked over a mesh or cable:
+`network.lan.device='br-lan.10'`, `network.guest.device='br-lan.20'`) has no VLAN membership of its own, so
+ULA traffic on `br-lan` itself would not pass. When `device` (default `br-lan`) is such a bridge, ApmonD uses
+the lan network's L3 device instead (`network.lan.device`, else `ifstatus lan` `l3_device`) if it is a VLAN
+subinterface `<bridge>.<vid>` of it: the ULA addresses, the collector `::1` claim and send/listen use
+`br-lan.10`, and status `device` / `ula_addresses` show it. It is resolved when ApmonD starts. An explicit
+`option device 'br-lan.10'` also works as an override. Bridge detection and MAC tables still use the parent
+`br-lan`; VLAN subinterfaces are never treated as separate bridges.
+
+Wired client entries on a vlan_filtering bridge get `"vlan": "<vid>"` after `stats_scope`, taken from
+`bridge fdb show` (package `ip-bridge`; BusyBox `brctl` gives no VLAN, then the key is omitted). The bridge
+keeps one fdb entry per MAC and VLAN, but a JSON key can't repeat, so there is one entry per MAC and a MAC
+seen in several VLANs gets its VIDs comma-joined in ascending order, e.g. `"vlan": "10,20"`. On a bridge
+without vlan_filtering the key is never present.
+
 Upgrading: if your `/etc/config/apmond` has been changed (e.g. by `apmond debuglevel`), apk keeps it and
 installs the new default beside it as `/etc/config/apmond.apk-new`; compare the two to see new option comments.
 

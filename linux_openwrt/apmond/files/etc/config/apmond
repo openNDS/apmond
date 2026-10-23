@@ -18,6 +18,7 @@ config apmond 'setup'
 	#option interval '30'                       # seconds between reports, minimum 10
 	#option startup_delay '60'                  # seconds before the first report
 	#option device 'br-lan'                     # carries the ULA addresses, its MAC identifies this node
+	# On a vlan_filtering bridge the lan VLAN subinterface (network.lan.device, e.g. br-lan.10) is used automatically
 	# Wired client bridges: unset or 'auto' (default) = every bridge except the wan/upstream bridge,
 	# re-detected each pass (e.g. br-lan and br-guest). List bridge names instead to limit the scan to them.
 	#list bridge 'auto'

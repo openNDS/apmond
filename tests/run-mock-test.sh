@@ -477,6 +477,61 @@ echo "$OLD" > "$W/run-D/daemon_checksum"; D status > "$W/dc3.json"; grep -qx "  
 D cleanup >/dev/null 2>&1; [ ! -f "$W/run-D/daemon_checksum" ] && ok "cleanup removes daemon_checksum" || ko "cleanup daemon_checksum"
 grep -q '"apmond_checksum\\": \\"$checksum\\"' "$REPO/src/apmond" && ok "node_status apmond_checksum = hash of the sending process's own script (daemon or CLI send)" || ko "apmond_checksum source"
 
+echo "== 15. VLAN-aware bridge (vlan_filtering=1, lan on br-lan.10, guest on br-lan.20)"
+VL="$W/vlmock"; N="$VL/net"; mkdir -p "$VL/bin" "$VL/uci" "$VL/run/apmond" "$N/br-lan/bridge" "$N/br-lan/brif/eth0.1" "$N/br-lan/brif/mesh0" "$N/br-lan.10" "$N/br-lan.20" "$N/eth0.1/statistics" "$N/mesh0/phy80211" "$N/br-plain/bridge" "$N/br-plain/brif/eth1"
+echo 1 > "$N/br-lan/bridge/vlan_filtering"; echo 0 > "$N/br-plain/bridge/vlan_filtering"; echo 1 > "$N/br-lan/brif/eth0.1/port_no"; echo 2 > "$N/br-lan/brif/mesh0/port_no"
+echo 100 > "$N/eth0.1/speed"; echo up > "$N/eth0.1/operstate"; echo 1111 > "$N/eth0.1/statistics/rx_bytes"; echo 2222 > "$N/eth0.1/statistics/tx_bytes"
+cat > "$VL/bin/bridge" <<'EOS'
+#!/bin/sh
+[ "$*" = "fdb show br br-lan" ] || exit 1
+cat <<EOF
+33:33:00:00:00:01 dev br-lan self permanent
+94:83:c4:52:68:73 dev br-lan vlan 10 master br-lan permanent
+02:aa:00:00:00:01 dev eth0.1 vlan 20 master br-lan
+02:aa:00:00:00:01 dev eth0.1 vlan 10 master br-lan
+02:aa:00:00:00:02 dev eth0.1 vlan 10 master br-lan
+02:aa:00:00:00:01 dev eth0.1 vlan 20 master br-lan
+94:83:c4:2e:f9:d1 dev mesh0 vlan 10 master br-lan
+aa:bb:cc:dd:ee:ff dev eth0.1 self permanent
+EOF
+EOS
+chmod +x "$VL/bin/bridge"
+cat > "$VL/uci/network" <<'EOS'
+network.lan=interface
+network.lan.device='br-lan.10'
+network.guest=interface
+network.guest.device='br-lan.20'
+network.trunk=interface
+network.trunk.device='br-lan'
+network.trunk.proto='none'
+EOS
+echo "apmond.setup=apmond" > "$VL/uci/apmond"
+awk '/^(get_option|resolve_id_device|get_bridge_fdb|wan_devices|detect_bridges|get_ethernet_clients|get_eth_stats|get_link_speed|swconfig_vlan_speed|append_block|log_debug)\(\) \{/,/^}/' "$REPO/src/apmond" > "$VL/fns.sh"
+vl() { busybox env PATH="$VL/bin:$W/mock:$W/bb" MOCK_UCI_DIR="$VL/uci" APMOND_SYSFS_NET="$N" busybox sh -c "bridge_auto=1; bridge_list=''; tmpdir='$VL/run'; . '$VL/fns.sh'; $1"; }
+[ "$(vl 'resolve_id_device; echo $id_device $id_bridge')" = "br-lan.10 br-lan" ] && ok "vlan_filtering br-lan: id device = network.lan.device br-lan.10, parent bridge br-lan" || ko "resolve: $(vl 'resolve_id_device; echo $id_device $id_bridge')"
+echo "apmond.setup.device='br-lan.10'" >> "$VL/uci/apmond"
+[ "$(vl 'resolve_id_device; echo $id_device $id_bridge')" = "br-lan.10 br-lan" ] && ok "explicit option device 'br-lan.10' used as is (override), parent bridge br-lan" || ko "explicit vlan device"
+echo "apmond.setup=apmond" > "$VL/uci/apmond"; echo "apmond.setup.device='br-plain'" >> "$VL/uci/apmond"
+[ "$(vl 'resolve_id_device; echo $id_device $id_bridge')" = "br-plain br-plain" ] && ok "explicit device on a non-filtering bridge unchanged" || ko "explicit plain device"
+echo "apmond.setup=apmond" > "$VL/uci/apmond"; sed -i "s/^network.lan.device=.*/network.lan.device='br-lan'/" "$VL/uci/network"
+[ "$(vl 'resolve_id_device; echo $id_device')" = "br-lan" ] && ok "lan device not a VLAN subinterface: br-lan kept" || ko "non-subif lan device"
+sed -i "s/^network.lan.device=.*/network.lan.device='br-lan.10'/" "$VL/uci/network"
+[ "$(vl 'resolve_id_device; detect_bridges; echo $bridges')" = "br-lan br-plain" ] && ok "bridge detection: br-lan (parent) found, br-lan.10/.20 not taken as bridges" || ko "detect: $(vl 'resolve_id_device; detect_bridges; echo $bridges')"
+vl 'resolve_id_device; bridge_auto=0; bridge_list=br-lan; first_block=1; eth_sta=0; get_ethernet_clients' >/dev/null 2>&1
+{ echo "{"; cat "$VL/run/apmond/clients"; echo "}"; } > "$VL/c.json"
+"$PY" - "$VL/c.json" <<'EOP' && ok "vlan key: one entry per MAC, VIDs comma-joined ascending, after stats_scope; mesh0 (wireless) port skipped" || ko "vlan clients: $(cat "$VL/c.json")"
+import json,sys
+t=open(sys.argv[1]).read(); d=json.loads(t)
+assert list(d)==["eth0.1@br-lan"], d
+p=d["eth0.1@br-lan"]; assert list(p)==["02:aa:00:00:00:01","02:aa:00:00:00:02"], p
+assert p["02:aa:00:00:00:01"]["vlan"]=="10,20" and p["02:aa:00:00:00:02"]["vlan"]=="10"
+assert list(p["02:aa:00:00:00:01"])==["rx_bytes","tx_bytes","rx_bitrate","tx_bitrate","stats_scope","vlan","timestamp","date_time"]
+assert p["02:aa:00:00:00:02"]["rx_bytes"]=="1111" and p["02:aa:00:00:00:02"]["stats_scope"]=="port"
+EOP
+JQ2=$(PATH="$SPATH" command -v jq || true); { printf '{\n  "s": {\n    "c": {\n'; cat "$VL/run/apmond/clients"; printf '    }\n  }\n}\n'; } > "$VL/w.json"
+{ [ -z "$JQ2" ] || "$JQ2" . "$VL/w.json" | cmp -s - "$VL/w.json"; } && ok "vlan clients block byte-identical to jq . (${JQ2:-jq not installed, skipped})" || ko "vlan block vs jq: $("$JQ2" . "$VL/w.json" | diff - "$VL/w.json" | head)"
+! grep -q '"vlan"' "$W/report.json" && ok "no vlan key for wired clients on a non-filtering bridge (apmbr0)" || ko "vlan key on plain bridge"
+
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
 $SUDO ip -6 addr del "$RULA/128" dev lo 2>/dev/null

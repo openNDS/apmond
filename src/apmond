@@ -203,7 +203,7 @@ load_config() {
 	default_seed_warn_interval=$(get_option setup default_seed_warn_interval 21600)
 	interval=$(get_option setup interval 30)
 	startup_delay=$(get_option setup startup_delay 60)
-	id_device=$(get_option setup device br-lan)
+	resolve_id_device
 	# bridge is a uci list (list bridge 'br-lan'); uci get returns list values space separated,
 	# and a legacy single "option bridge" still works. Unset: every bridge is auto-detected each pass (detect_bridges)
 	bridge_list=$(get_option setup bridge "")
@@ -1575,11 +1575,47 @@ get_ap_data() {
 	rm -f "$tmpdir/apmond/clients.loc"
 }
 
-get_bridge_fdb() {
-	# Output "<ifname> <mac>" for every non-local mac learned on bridge $1
-	local bridge="$1"
+# resolve_id_device: sets $id_device (ULA addresses, collector claim, send/listen) and $id_bridge (its bridge,
+# for bridge detection and MAC tables). option device (default br-lan) is used as is, unless it is a bridge
+# with vlan_filtering=1: such a bridge carries no untagged traffic of its own, so the L3 device of the lan
+# network (network.lan.device, else ifstatus lan l3_device) is used when it is a VLAN subinterface
+# <bridge>.<vid> of it, e.g. br-lan.10. An explicit option device 'br-lan.10' also works (override).
+resolve_id_device() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" l3 vid parent
 
-	if command -v brctl >/dev/null 2>&1 && brctl showmacs "$bridge" >/dev/null 2>&1; then
+	id_device=$(get_option setup device br-lan)
+	id_bridge=""
+
+	if [ "$(cat "$sysnet/$id_device/bridge/vlan_filtering" 2>/dev/null)" = "1" ]; then
+		for l3 in $(uci -q get network.lan.device) $(ifstatus lan 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); do
+			case "$l3" in
+				"$id_device".*)
+					vid=${l3#"$id_device".}
+					case "$vid" in ''|*[!0-9]*) continue ;; esac
+					id_bridge="$id_device"
+					id_device="$l3"
+					break
+				;;
+			esac
+		done
+	fi
+
+	# A VLAN subinterface of a bridge: bridge detection and MAC tables use the parent bridge
+	case "$id_device" in
+		*.*) parent=${id_device%.*}; [ -d "$sysnet/$parent/bridge" ] && id_bridge="$parent" ;;
+	esac
+	id_bridge=${id_bridge:-$id_device}
+}
+
+get_bridge_fdb() {
+	# Output "<ifname> <mac> [<vid>]" for every non-local mac learned on bridge $1.
+	# A vlan_filtering bridge has one fdb entry per MAC and VLAN; the VID is only known from ip-bridge
+	# (bridge fdb show), so it is preferred there. brctl/brforward give no VID.
+	local bridge="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+
+	if [ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && command -v bridge >/dev/null 2>&1; then
+		bridge fdb show br "$bridge" 2>/dev/null | awk '!/permanent/ && !/self/ && $2 == "dev" {v=""; for (i=3; i<NF; i++) if ($i == "vlan") v=$(i+1); print $3, $1, v}'
+	elif command -v brctl >/dev/null 2>&1 && brctl showmacs "$bridge" >/dev/null 2>&1; then
 		# brctl reports a port number, map it to an interface name using sysfs
 		brctl showmacs "$bridge" 2>/dev/null | tail -n +2 | awk '$3 == "no" {print $1, $2}' | while read portno mac; do
 			for brif in /sys/class/net/"$bridge"/brif/*; do
@@ -1640,7 +1676,8 @@ detect_bridges() {
 
 	wan_devices
 
-	for d in "$sysnet/$id_device/bridge" "$sysnet"/*/bridge; do
+	# VLAN subinterfaces (br-lan.10) have no bridge/ dir, so they are never taken as separate bridges
+	for d in "$sysnet/${id_bridge:-$id_device}/bridge" "$sysnet"/*/bridge; do
 		[ -d "$d" ] || continue
 		br=${d%/bridge}; br=${br##*/}
 		case " $found " in *" $br "*) continue ;; esac
@@ -1662,13 +1699,13 @@ detect_bridges() {
 }
 
 get_ethernet_clients() {
-	local first=1
+	local first=1 sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
 
 	detect_bridges
 	wan_devices
 
 	for bridge in $bridges; do
-		[ -d "/sys/class/net/$bridge/bridge" ] || continue
+		[ -d "$sysnet/$bridge/bridge" ] || continue
 
 		# Ports from the static network config, if listed, otherwise all wired bridge members
 		net_device=$(uci -q show network | grep "\.name='$bridge'" | head -n 1 | awk -F "." '{printf "%s.%s", $1, $2}')
@@ -1676,7 +1713,7 @@ get_ethernet_clients() {
 		[ -n "$net_device" ] && bridge_ports=$(uci -q get "$net_device.ports")
 
 		if [ -z "$bridge_ports" ]; then
-			for brif in /sys/class/net/"$bridge"/brif/*; do
+			for brif in "$sysnet"/"$bridge"/brif/*; do
 				[ -e "$brif" ] || continue
 				bridge_ports="$bridge_ports ${brif##*/}"
 			done
@@ -1686,20 +1723,33 @@ get_ethernet_clients() {
 
 		for port in $bridge_ports; do
 			# wireless clients are reported from iw station dump
-			if [ -e "/sys/class/net/$port/phy80211" ] || [ -e "/sys/class/net/$port/wireless" ]; then
+			if [ -e "$sysnet/$port/phy80211" ] || [ -e "$sysnet/$port/wireless" ]; then
 				continue
 			fi
 			# mesh11sd vxlan tunnel port: its macs are other nodes' clients (as mesh11sd get_ethernet_clients); upstream port
 			case "$port" in vxlan*) continue ;; esac
 			case "$wan_devs" in *" $port "*) continue ;; esac
 
-			macs=$(awk -v p="$port" '$1 == p {print $2}' "$tmpdir/fdb")
+			# One entry per MAC (a JSON key can't repeat): a MAC seen in several VLANs gets its VIDs comma-joined, ascending
+			macs=$(awk -v p="$port" '$1 == p {
+				if (!($2 in v)) { o[++n]=$2; v[$2]="" }
+				if ($3 != "" && index("," v[$2] ",", "," $3 ",") == 0) v[$2]=(v[$2] == "" ? $3 : v[$2] "," $3)
+			} END {
+				for (i=1; i<=n; i++) {
+					c=split(v[o[i]], a, ",")
+					for (j=2; j<=c; j++) { t=a[j]; k=j-1; while (k>0 && a[k]+0 > t+0) { a[k+1]=a[k]; k-- } a[k+1]=t }
+					s=""; for (j=1; j<=c; j++) s=(s == "" ? a[j] : s "," a[j])
+					print o[i] "|" s
+				}
+			}' "$tmpdir/fdb")
 			[ -z "$macs" ] && continue
 			get_eth_stats "$port" || continue
 			eth_sta=1 # flag that we have some stations
 			echo "      \"$port@$bridge\": {" > "$tmpdir/apmond_block"
 
 			for mac in $macs; do
+				vids=${mac#*|}
+				mac=${mac%%|*}
 				timestamp=$(date +%s)000
 				date_time="$(date -d "@${timestamp:0:10}")"
 				date_time=$(echo ${date_time// /_})
@@ -1709,6 +1759,7 @@ get_ethernet_clients() {
 				echo "          \"rx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
 				echo "          \"tx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
 				echo "          \"stats_scope\": \"port\"," >> "$tmpdir/apmond_block"
+				[ -n "$vids" ] && echo "          \"vlan\": \"$vids\"," >> "$tmpdir/apmond_block"
 				echo "          \"timestamp\": \"$timestamp\"," >> "$tmpdir/apmond_block"
 				echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
 				echo "        }," >> "$tmpdir/apmond_block"
@@ -1787,17 +1838,17 @@ get_link_speed() {
 }
 
 get_eth_stats() {
-	local iface="$1"
+	local iface="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
 
 	[ -z "$iface" ] && return 1
-	[ ! -d "/sys/class/net/$iface" ] && return 1
+	[ ! -d "$sysnet/$iface" ] && return 1
 
 	# Link rate (Mb/s): sysfs, else swconfig for VLAN interfaces, else "unknown"
 	speed=$(get_link_speed "$iface")
 
 	# RX / TX bytes from sysfs
-	rx_bytes=$(cat "/sys/class/net/$iface/statistics/rx_bytes" 2>/dev/null)
-	tx_bytes=$(cat "/sys/class/net/$iface/statistics/tx_bytes" 2>/dev/null)
+	rx_bytes=$(cat "$sysnet/$iface/statistics/rx_bytes" 2>/dev/null)
+	tx_bytes=$(cat "$sysnet/$iface/statistics/tx_bytes" 2>/dev/null)
 
 	# Fallback to ip -s if sysfs counters are missing
 	if [ -z "$rx_bytes" ] || [ -z "$tx_bytes" ]; then
