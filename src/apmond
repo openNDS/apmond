@@ -1607,6 +1607,31 @@ resolve_id_device() {
 	id_bridge=${id_bridge:-$id_device}
 }
 
+# port_access_vlan <bridge> <port>: the VID of an access port of a vlan_filtering bridge, from the UCI
+# bridge-vlan sections (option device <bridge>, option vlan N, list ports '<port>[:u|:t][*]'), so no ip-bridge
+# is needed. Access port = member of exactly one VLAN, untagged (no suffix counts as untagged, as in OpenWrt).
+# Prints nothing for a trunk / multi-VLAN / tagged-only port or a port in no bridge-vlan.
+port_access_vlan() {
+	uci -q show network 2>/dev/null | awk -v br="$1" -v port="$2" '
+		{ eq=index($0, "="); k=substr($0, 1, eq-1); v=substr($0, eq+1); n=split(k, a, ".") }
+		n == 2 && v == "bridge-vlan" { bv[a[2]]=1; next }
+		n == 3 { gsub(/\047/, "", v); f[a[2], a[3]]=v }
+		END {
+			for (sec in bv) {
+				if (f[sec, "device"] != br) continue
+				c=split(f[sec, "ports"], p, " ")
+				for (i=1; i<=c; i++) {
+					m=p[i]; sub(/\*$/, "", m); t="u"
+					if (m ~ /:[ut]$/) { t=substr(m, length(m)); m=substr(m, 1, length(m)-2) }
+					if (m != port) continue
+					mem++
+					if (t == "u") vid=f[sec, "vlan"]; else tagged++
+				}
+			}
+			if (mem == 1 && !tagged && vid ~ /^[0-9]+$/) print vid
+		}'
+}
+
 get_bridge_fdb() {
 	# Output "<ifname> <mac> [<vid>]" for every non-local mac learned on bridge $1.
 	# A vlan_filtering bridge has one fdb entry per MAC and VLAN; the VID is only known from ip-bridge
@@ -1618,7 +1643,7 @@ get_bridge_fdb() {
 	elif command -v brctl >/dev/null 2>&1 && brctl showmacs "$bridge" >/dev/null 2>&1; then
 		# brctl reports a port number, map it to an interface name using sysfs
 		brctl showmacs "$bridge" 2>/dev/null | tail -n +2 | awk '$3 == "no" {print $1, $2}' | while read portno mac; do
-			for brif in /sys/class/net/"$bridge"/brif/*; do
+			for brif in "$sysnet"/"$bridge"/brif/*; do
 				[ -f "$brif/port_no" ] || continue
 
 				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
@@ -1627,14 +1652,14 @@ get_bridge_fdb() {
 				fi
 			done
 		done
-	elif [ -r "/sys/class/net/$bridge/brforward" ] && hexdump -v -e '1/1 "%02x"' /dev/null >/dev/null 2>&1; then
+	elif [ -r "$sysnet/$bridge/brforward" ] && hexdump -v -e '1/1 "%02x"' /dev/null >/dev/null 2>&1; then
 		# brctl without showmacs (FEATURE_BRCTL_FANCY off): read the kernel fdb directly, as brctl does.
 		# struct __fdb_entry (16 bytes): mac[6] port_no is_local ageing_timer[4] port_hi pad unused[2]
-		hexdump -v -e '16/1 "%02x " "\n"' "/sys/class/net/$bridge/brforward" 2>/dev/null |
+		hexdump -v -e '16/1 "%02x " "\n"' "$sysnet/$bridge/brforward" 2>/dev/null |
 		awk 'NF == 16 && $8 == "00" {printf "%s:%s:%s:%s:%s:%s %s%s\n", $1, $2, $3, $4, $5, $6, $13, $7}' |
 		while read mac portno; do
 			portno=$((0x$portno))
-			for brif in /sys/class/net/"$bridge"/brif/*; do
+			for brif in "$sysnet"/"$bridge"/brif/*; do
 				[ -f "$brif/port_no" ] || continue
 
 				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
@@ -1744,11 +1769,15 @@ get_ethernet_clients() {
 			}' "$tmpdir/fdb")
 			[ -z "$macs" ] && continue
 			get_eth_stats "$port" || continue
+			# Access port VLAN from UCI (no ip-bridge needed); a per-MAC VID from bridge fdb takes precedence
+			port_vid=""
+			[ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_vid=$(port_access_vlan "$bridge" "$port")
 			eth_sta=1 # flag that we have some stations
 			echo "      \"$port@$bridge\": {" > "$tmpdir/apmond_block"
 
 			for mac in $macs; do
 				vids=${mac#*|}
+				[ -z "$vids" ] && vids="$port_vid"
 				mac=${mac%%|*}
 				timestamp=$(date +%s)000
 				date_time="$(date -d "@${timestamp:0:10}")"

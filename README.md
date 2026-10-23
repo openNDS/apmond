@@ -63,11 +63,15 @@ subinterface `<bridge>.<vid>` of it: the ULA addresses, the collector `::1` clai
 `option device 'br-lan.10'` also works as an override. Bridge detection and MAC tables still use the parent
 `br-lan`; VLAN subinterfaces are never treated as separate bridges.
 
-Wired client entries on a vlan_filtering bridge get `"vlan": "<vid>"` after `stats_scope`, taken from
-`bridge fdb show` (package `ip-bridge`; BusyBox `brctl` gives no VLAN, then the key is omitted). The bridge
-keeps one fdb entry per MAC and VLAN, but a JSON key can't repeat, so there is one entry per MAC and a MAC
-seen in several VLANs gets its VIDs comma-joined in ascending order, e.g. `"vlan": "10,20"`. On a bridge
-without vlan_filtering the key is never present.
+Wired client entries on a vlan_filtering bridge get `"vlan": "<vid>"` after `stats_scope`. No extra package
+is needed: for an access port (a member of exactly one VLAN, untagged, e.g. `list ports 'eth0.1:u*'`; a port
+listed without a suffix counts as untagged) the VID comes from the UCI `bridge-vlan` sections of that bridge
+and is set on every client of the port. A trunk or multi-VLAN port can't be resolved per MAC from UCI, so
+its clients have no `vlan` key, unless the optional `ip-bridge` package is installed: then `bridge fdb show`
+gives each MAC's own VLAN(s), which take precedence, on any port. ApmonD does not depend on ip-bridge.
+The bridge keeps one fdb entry per MAC and VLAN, but a JSON key can't repeat, so there is one entry per MAC
+and a MAC seen in several VLANs gets its VIDs comma-joined in ascending order, e.g. `"vlan": "10,20"`. On a
+bridge without vlan_filtering the key is never present.
 
 Upgrading: if your `/etc/config/apmond` has been changed (e.g. by `apmond debuglevel`), apk keeps it and
 installs the new default beside it as `/etc/config/apmond.apk-new`; compare the two to see new option comments.

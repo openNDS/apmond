@@ -506,7 +506,7 @@ network.trunk.device='br-lan'
 network.trunk.proto='none'
 EOS
 echo "apmond.setup=apmond" > "$VL/uci/apmond"
-awk '/^(get_option|resolve_id_device|get_bridge_fdb|wan_devices|detect_bridges|get_ethernet_clients|get_eth_stats|get_link_speed|swconfig_vlan_speed|append_block|log_debug)\(\) \{/,/^}/' "$REPO/src/apmond" > "$VL/fns.sh"
+awk '/^(get_option|resolve_id_device|port_access_vlan|get_bridge_fdb|wan_devices|detect_bridges|get_ethernet_clients|get_eth_stats|get_link_speed|swconfig_vlan_speed|append_block|log_debug)\(\) \{/,/^}/' "$REPO/src/apmond" > "$VL/fns.sh"
 vl() { busybox env PATH="$VL/bin:$W/mock:$W/bb" MOCK_UCI_DIR="$VL/uci" APMOND_SYSFS_NET="$N" busybox sh -c "bridge_auto=1; bridge_list=''; tmpdir='$VL/run'; . '$VL/fns.sh'; $1"; }
 [ "$(vl 'resolve_id_device; echo $id_device $id_bridge')" = "br-lan.10 br-lan" ] && ok "vlan_filtering br-lan: id device = network.lan.device br-lan.10, parent bridge br-lan" || ko "resolve: $(vl 'resolve_id_device; echo $id_device $id_bridge')"
 echo "apmond.setup.device='br-lan.10'" >> "$VL/uci/apmond"
@@ -531,6 +531,53 @@ EOP
 JQ2=$(PATH="$SPATH" command -v jq || true); { printf '{\n  "s": {\n    "c": {\n'; cat "$VL/run/apmond/clients"; printf '    }\n  }\n}\n'; } > "$VL/w.json"
 { [ -z "$JQ2" ] || "$JQ2" . "$VL/w.json" | cmp -s - "$VL/w.json"; } && ok "vlan clients block byte-identical to jq . (${JQ2:-jq not installed, skipped})" || ko "vlan block vs jq: $("$JQ2" . "$VL/w.json" | diff - "$VL/w.json" | head)"
 ! grep -q '"vlan"' "$W/report.json" && ok "no vlan key for wired clients on a non-filtering bridge (apmbr0)" || ko "vlan key on plain bridge"
+
+echo "== 15b. VLAN of wired clients from UCI bridge-vlan (no ip-bridge)"
+mkdir -p "$VL/nobr" "$N/br-lan/brif/eth0.2" "$N/eth0.2/statistics"; echo 3 > "$N/br-lan/brif/eth0.2/port_no"
+echo 100 > "$N/eth0.2/speed"; echo up > "$N/eth0.2/operstate"; echo 5 > "$N/eth0.2/statistics/rx_bytes"; echo 6 > "$N/eth0.2/statistics/tx_bytes"
+cat > "$VL/nobr/brctl" <<'EOS'
+#!/bin/sh
+[ "$*" = "showmacs br-lan" ] || exit 1
+printf 'port no\tmac addr\t\tis local?\tageing timer\n'
+printf '  1\t02:aa:00:00:00:01\tno\t\t   1.00\n  1\t02:aa:00:00:00:01\tno\t\t   1.00\n  1\t02:aa:00:00:00:02\tno\t\t   1.00\n'
+printf '  3\t02:bb:00:00:00:01\tno\t\t   1.00\n  2\t94:83:c4:2e:f9:d1\tno\t\t   1.00\n  1\t94:83:c4:52:68:73\tyes\t\t   0.00\n'
+EOS
+chmod +x "$VL/nobr/brctl"
+cat >> "$VL/uci/network" <<'EOS'
+network.@bridge-vlan[0]=bridge-vlan
+network.@bridge-vlan[0].device='br-lan'
+network.@bridge-vlan[0].vlan='10'
+network.@bridge-vlan[0].ports='eth0.1:u*' 'mesh0:t' 'eth0.2:t'
+network.@bridge-vlan[1]=bridge-vlan
+network.@bridge-vlan[1].device='br-lan'
+network.@bridge-vlan[1].vlan='20'
+network.@bridge-vlan[1].ports='mesh0:t' 'eth0.2'
+network.@bridge-vlan[2]=bridge-vlan
+network.@bridge-vlan[2].device='br-other'
+network.@bridge-vlan[2].vlan='30'
+network.@bridge-vlan[2].ports='eth0.1'
+EOS
+vn() { busybox env PATH="$VL/nobr:$W/mock:$W/bb" MOCK_UCI_DIR="$VL/uci" APMOND_SYSFS_NET="$N" busybox sh -c "bridge_auto=0; bridge_list=br-lan; tmpdir='$VL/run'; . '$VL/fns.sh'; $1"; }
+[ "$(vn 'port_access_vlan br-lan eth0.1')" = 10 ] && [ -z "$(vn 'port_access_vlan br-lan eth0.2')" ] && [ -z "$(vn 'port_access_vlan br-lan mesh0')" ] && [ -z "$(vn 'port_access_vlan br-lan eth9')" ] && ok "port_access_vlan: access port 10; trunk, tagged-only and unlisted ports none" || ko "port_access_vlan"
+sed 's/eth0.1:u\*/eth0.1/' "$VL/uci/network" > "$VL/n2"; cp "$VL/uci/network" "$VL/n1"; cp "$VL/n2" "$VL/uci/network"
+[ "$(vn 'port_access_vlan br-lan eth0.1')" = 10 ] && ok "port listed without suffix counts as untagged" || ko "no-suffix port"
+cp "$VL/n1" "$VL/uci/network"
+command -v bridge >/dev/null 2>&1 && ko "test PATH unexpectedly has bridge" || true
+rm -f "$VL/run/apmond/clients"; vn 'resolve_id_device; first_block=1; eth_sta=0; get_ethernet_clients' >/dev/null 2>&1
+{ echo "{"; cat "$VL/run/apmond/clients"; echo "}"; } > "$VL/c2.json"
+"$PY" - "$VL/c2.json" <<'EOP' && ok "no ip-bridge: access port clients get vlan from UCI, trunk port clients have no vlan key, one entry per MAC" || ko "uci vlan clients: $(cat "$VL/c2.json")"
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert list(d)==["eth0.1@br-lan","eth0.2@br-lan"], d
+a=d["eth0.1@br-lan"]; assert list(a)==["02:aa:00:00:00:01","02:aa:00:00:00:02"], a
+assert all(e["vlan"]=="10" for e in a.values())
+assert list(a["02:aa:00:00:00:01"])==["rx_bytes","tx_bytes","rx_bitrate","tx_bitrate","stats_scope","vlan","timestamp","date_time"]
+assert "vlan" not in d["eth0.2@br-lan"]["02:bb:00:00:00:01"]
+EOP
+{ printf '{\n  "s": {\n    "c": {\n'; cat "$VL/run/apmond/clients"; printf '    }\n  }\n}\n'; } > "$VL/w2.json"
+{ [ -z "$JQ2" ] || "$JQ2" . "$VL/w2.json" | cmp -s - "$VL/w2.json"; } && ok "UCI vlan clients block byte-identical to jq ." || ko "uci vlan block vs jq"
+rm -f "$VL/run/apmond/clients"; vl 'resolve_id_device; bridge_auto=0; bridge_list=br-lan; first_block=1; eth_sta=0; get_ethernet_clients' >/dev/null 2>&1
+grep -A6 '"02:aa:00:00:00:01"' "$VL/run/apmond/clients" | grep -q '"vlan": "10,20"' && ok "bridge command present: per-MAC fdb VIDs override the UCI access VLAN" || ko "fdb override: $(cat "$VL/run/apmond/clients")"
 
 echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
 ! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"
