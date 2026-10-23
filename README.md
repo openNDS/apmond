@@ -30,6 +30,19 @@ for LuCI to pick up.
 
 See `linux_openwrt/apmond/files/etc/config/apmond` for every option.
 
+## Wired client bridges
+
+With `list bridge` unset (or set to `'auto'`, alone or with other entries) every bridge on the node is
+detected on each report pass and scanned for wired clients, e.g. both `br-lan` and `br-guest` in a home +
+guest setup; bridges added later are picked up automatically. Excluded: the upstream bridge (the
+`network.wan` / `wan6` device, or a bridge with that device as a member, unless wan is disabled), and
+bridges with no members other than a mesh11sd `vxlan` tunnel port. Wireless ports are reported from the
+station dump and `vxlan` ports are never scanned (their MACs are other nodes' clients). To scan only
+particular bridges, list them: `list bridge 'br-lan'`. The ULA addresses stay on `device` only.
+
+Upgrading: if your `/etc/config/apmond` has been changed (e.g. by `apmond debuglevel`), apk keeps it and
+installs the new default beside it as `/etc/config/apmond.apk-new`; compare the two to see new option comments.
+
 ## Storage
 
 As mesh11sd's `log_mountpoint`, the optional `apmond.setup.log_mountpoint` (default `/tmp`) selects where

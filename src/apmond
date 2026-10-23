@@ -205,8 +205,17 @@ load_config() {
 	startup_delay=$(get_option setup startup_delay 60)
 	id_device=$(get_option setup device br-lan)
 	# bridge is a uci list (list bridge 'br-lan'); uci get returns list values space separated,
-	# and a legacy single "option bridge" still works
-	bridges=$(get_option setup bridge "$id_device")
+	# and a legacy single "option bridge" still works. Unset: every bridge is auto-detected each pass (detect_bridges)
+	bridge_list=$(get_option setup bridge "")
+	# list bridge 'auto' (alone or with other entries) means the same as unset
+	bridge_auto=1
+	if [ -n "$bridge_list" ]; then
+		case " $bridge_list " in
+			*" auto "*) bridge_list=$(echo " $bridge_list " | sed 's/ auto / /g; s/^ *//; s/ *$//') ;;
+			*) bridge_auto=0 ;;
+		esac
+	fi
+	bridges="$bridge_list"
 	# router_detect (as mesh11sd portal_detect): 1 = auto detect (default), 0 = force router/collector, 2 = force peer
 	router_detect=$(get_option setup router_detect 1)
 	max_age=$(get_option setup max_age 120)
@@ -1606,8 +1615,57 @@ get_bridge_fdb() {
 	fi
 }
 
+# wan_devices: the upstream device(s) (network.wan / wan6 device and ifname), "" if wan is disabled.
+# mesh11sd trunk modes (portal_detect 4/5) disable wan and move its port onto br-tun<id> as a LAN port.
+wan_devices() {
+	local w
+
+	wan_devs=" "
+	[ "$(uci -q get network.wan.disabled)" = "1" ] && return 0
+	for w in $(uci -q get network.wan.device) $(uci -q get network.wan.ifname) $(uci -q get network.wan6.device); do
+		case "$wan_devs" in *" $w "*) ;; *) wan_devs="$wan_devs$w " ;; esac
+	done
+}
+
+# detect_bridges: sets $bridges. With list bridge set, the list as configured. Otherwise every bridge in sysfs
+# (device first), except the upstream bridge (it is, or has as a member, the wan device) and bridges with no
+# member other than mesh11sd vxlan tunnel ports (nothing wired to scan). Cheap: one sysfs glob, three uci reads.
+detect_bridges() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" d br brif m members up found=""
+
+	if [ "$bridge_auto" -ne 1 ]; then
+		bridges="$bridge_list"
+		return 0
+	fi
+
+	wan_devices
+
+	for d in "$sysnet/$id_device/bridge" "$sysnet"/*/bridge; do
+		[ -d "$d" ] || continue
+		br=${d%/bridge}; br=${br##*/}
+		case " $found " in *" $br "*) continue ;; esac
+		case "$wan_devs" in *" $br "*) continue ;; esac
+		members=0; up=0
+
+		for brif in "$sysnet/$br"/brif/*; do
+			[ -e "$brif" ] || continue
+			m=${brif##*/}
+			case "$wan_devs" in *" $m "*) up=1; break ;; esac
+			case "$m" in vxlan*) continue ;; esac
+			members=$((members+1))
+		done
+
+		[ "$up" -eq 0 ] && [ "$members" -gt 0 ] && found="${found:+$found }$br"
+	done
+
+	bridges="$found"
+}
+
 get_ethernet_clients() {
 	local first=1
+
+	detect_bridges
+	wan_devices
 
 	for bridge in $bridges; do
 		[ -d "/sys/class/net/$bridge/bridge" ] || continue
@@ -1631,6 +1689,9 @@ get_ethernet_clients() {
 			if [ -e "/sys/class/net/$port/phy80211" ] || [ -e "/sys/class/net/$port/wireless" ]; then
 				continue
 			fi
+			# mesh11sd vxlan tunnel port: its macs are other nodes' clients (as mesh11sd get_ethernet_clients); upstream port
+			case "$port" in vxlan*) continue ;; esac
+			case "$wan_devs" in *" $port "*) continue ;; esac
 
 			macs=$(awk -v p="$port" '$1 == p {print $2}' "$tmpdir/fdb")
 			[ -z "$macs" ] && continue
@@ -2360,6 +2421,8 @@ show_status() {
 		echo "    \"collector\": \"$(json_str "$router_ula")\","
 		echo "    \"device\": \"$(json_str "$id_device")\","
 		echo "    \"ap_mac_id\": \"$(json_str "$device_mac")\","
+		detect_bridges
+		echo "    \"bridge_detect\": \"$([ "$bridge_auto" -eq 1 ] && echo auto || echo list)\","
 		printf '    "bridges": '
 		json_array "    " $bridges
 		echo ","
@@ -2367,13 +2430,15 @@ show_status() {
 		echo "    \"role_reason\": \"$(json_str "${role_reason:-none}")\","
 		echo "    \"node_ula\": \"$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")\","
 
-		for i in $id_device $bridges; do
+		for i in $id_device $bridge_list; do
 			case " $ifaces " in *" $i "*) ;; *) ifaces="$ifaces $i" ;; esac
 		done
 		echo "    \"ula_addresses\": {"
 		first=1
+		# kernel shows addresses in canonical form (no leading zeros in a group): compare canonical prefixes
+		ula_base_c=$(echo "$ula_base" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g')
 		for i in $ifaces; do
-			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base:" '$1=="inet6" && index($2,p)==1 {print $2}')
+			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base_c:" '$1=="inet6" && index($2,p)==1 {print $2}')
 			[ "$first" -eq 1 ] || echo ","
 			first=0
 			printf '      "%s": ' "$(json_str "$i")"

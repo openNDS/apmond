@@ -18,7 +18,9 @@ config apmond 'setup'
 	#option interval '30'                       # seconds between reports, minimum 10
 	#option startup_delay '60'                  # seconds before the first report
 	#option device 'br-lan'                     # carries the ULA addresses, its MAC identifies this node
-	#list bridge 'br-lan'                       # bridge(s) to scan for wired clients, one list line each (default: device)
+	# Wired client bridges: unset or 'auto' (default) = every bridge except the wan/upstream bridge,
+	# re-detected each pass (e.g. br-lan and br-guest). List bridge names instead to limit the scan to them.
+	#list bridge 'auto'
 	#option router_detect '1'                   # 1 auto, 0 force router/collector, 2 force peer
 	#option router_takeover_misses '3'          # backed-off router: take over after ::1 misses this many checks
 	#option claim_delay_max '10'               # random 0..N s delay before first claiming ::1

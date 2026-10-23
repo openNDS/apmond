@@ -211,7 +211,8 @@ cp "$W/uci-C/apmond" "$W/cb.bak"; echo "apmond.setup.bridge='apmbr2' 'apmbr0'" >
 C send && R show_ap_data "$CID" | grep -q '"apmdum0@apmbr0"' && ok "list bridge: wired client still found on 2nd list bridge" || ko "list bridge wired scan"
 cp "$W/cb.bak" "$W/uci-C/apmond"; echo "apmond.setup.bridge='apmbr0'" >> "$W/uci-C/apmond"
 [ "$(C status | jv bridges)" = "apmbr0" ] && ok "legacy single option bridge still works" || ko "legacy option bridge"
-cp "$W/cb.bak" "$W/uci-C/apmond"; [ "$(C status | jv bridges)" = "apmbr0" ] && ok "bridge defaults to device" || ko "bridge default"
+cp "$W/cb.bak" "$W/uci-C/apmond"; [ "$(C status | jv bridges | awk '{print $1}')" = "apmbr0" ] && [ "$(C status | jv bridge_detect)" = "auto" ] && ! C status | jv bridges | grep -qw "apmbr1\|apmbr2" && ok "no list bridge: auto-detected, device first, member-less bridges skipped" || ko "bridge default $(C status | jv bridges)"
+[ "$(C status | jv ula_addresses | "$PY" -c 'import json,sys; print(" ".join(json.load(sys.stdin)))')" = "apmbr0" ] && ok "auto bridges: ula_addresses still only on device" || ko "auto ula_addresses $(C status | jv ula_addresses)"
 R show_ap_data all > "$W/all.json"; json_ok < "$W/all.json" && [ "$(grep -c '"clients@' "$W/all.json")" -eq 2 ] && ok "show_ap_data all: valid JSON, 2 APs" || ko "show_ap_data all"
 C show_ap_data | grep -q "$CID" && ko "peer stored data" || ok "peer stores nothing (reports only go to the router)"
 
@@ -439,6 +440,24 @@ grep -q '"[a-z_]*":[^ ]' "$W/sd.json" && ko "key without space after colon" || o
 
 rm -rf "$PT/run/protocol_mismatch"; : > "$PT/log"; rep ' "Bands": ["2.4GHz","5GHz"], "apmond_protocol": "1",'; chk; [ ! -s "$PT/log" ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "older report with inline arrays: protocol still read, no mismatch" || ko "inline array report $(cat "$PT/log")"
 hx "$(printf '{\n  "System@x": {\n    "Bands": [\n      "2.4GHz"\n    ],\n    "node_status": {\n      "apmond_protocol": "1",\n      "f": "x"\n    }\n  }\n}')" > "$PT/rep"; : > "$PT/log"; chk; [ ! -s "$PT/log" ] && [ ! -f "$PT/run/protocol_mismatch/020000aa0009" ] && ok "jq-style multi-line report: protocol read, no mismatch" || ko "multiline report $(cat "$PT/log")"
+
+echo "== 13. Automatic bridge detection (list bridge unset)"
+BD="$W/bd"; FS="$BD/net"; mkdir -p "$BD/uci"
+mkb() { b=$1; shift; mkdir -p "$FS/$b/bridge" "$FS/$b/brif"; for m in "$@"; do mkdir -p "$FS/$m"; touch "$FS/$b/brif/$m"; done; }
+mkb br-lan lan1 lan2 phy0-ap0; mkb br-guest lan3 phy0-ap1; mkb br-wan eth1; mkb br-empty; mkb br-tun69 vxlan69; mkb docker0 veth1
+echo "network.wan.device='br-wan'" > "$BD/uci/network"
+awk '/^wan_devices\(\) \{/,/^}/; /^detect_bridges\(\) \{/,/^}/' "$REPO/src/apmond" > "$BD/fns.sh"
+bd() { busybox env PATH="$W/mock:$W/bb" MOCK_UCI_DIR="$BD/uci" APMOND_SYSFS_NET="$FS" busybox sh -c ". '$BD/fns.sh'; id_device='$1'; bridge_list='$2'; bridge_auto=\$([ -n '$2' ] && echo 0 || echo 1); detect_bridges; echo \"\$bridges\""; }
+[ "$(bd br-lan '')" = "br-lan br-guest docker0" ] && ok "home + guest: both bridges scanned by default (device first)" || ko "auto home+guest: $(bd br-lan '')"
+[ "$(bd br-lan 'br-guest')" = "br-guest" ] && [ "$(bd br-lan 'br-lan br-empty')" = "br-lan br-empty" ] && ok "list bridge limits the scan to the list, as configured" || ko "list bridge: $(bd br-lan br-guest)"
+bd br-lan '' | grep -qw br-wan && ko "wan bridge scanned" || ok "upstream bridge (network.wan.device) excluded"
+echo "network.wan.device='eth1'" > "$BD/uci/network"; bd br-lan '' | grep -qw br-wan && ko "bridge with wan member scanned" || ok "bridge with the wan device as a member excluded"
+bd br-lan '' | grep -qw "br-empty\|br-tun69" && ko "empty/vxlan-only bridge scanned" || ok "bridges with no members, or only a mesh11sd vxlan port, skipped"
+echo "network.wan.disabled='1'" >> "$BD/uci/network"; bd br-lan '' | grep -qw br-wan && ok "wan disabled (mesh11sd trunk: wan port moved to br-tun): that bridge is scanned" || ko "wan disabled: $(bd br-lan '')"
+mkb br-iot lan4; bd br-lan '' | grep -qw br-iot && ok "re-detected each call: a bridge added later is picked up" || ko "new bridge"
+cp "$W/uci-C/apmond" "$W/cb2.bak"; echo "apmond.setup.bridge='auto'" >> "$W/uci-C/apmond"; a1=$(C status | jv bridge_detect); sed -i "s/bridge='auto'/bridge='apmbr2' 'auto'/" "$W/uci-C/apmond"; a2=$(C status | jv bridge_detect); a3=$(C status | jv bridges | awk '{print $1}'); cp "$W/cb2.bak" "$W/uci-C/apmond"
+[ "$a1" = auto ] && [ "$a2" = auto ] && [ "$a3" = apmbr0 ] && ok "list bridge 'auto' (alone or with other entries) = unset: auto-detect all non-wan bridges" || ko "list bridge auto: $a1 $a2 $a3"
+grep -q 'case "$port" in vxlan\*) continue' "$REPO/src/apmond" && ok "wired scan skips mesh11sd vxlan ports (remote clients) as mesh11sd does" || ko "vxlan port skip"
 
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
