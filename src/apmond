@@ -49,7 +49,7 @@ write_to_syslog() {
 
 	if [ -n "$entrynum_file" ]; then
 		# daemon: counter shared through the run dir, so log calls in $(...) subshells keep it in step
-		read -r entrynum < "$entrynum_file" 2>/dev/null
+		[ -f "$entrynum_file" ] && read -r entrynum < "$entrynum_file"
 		entrynum=$((${entrynum:-0} + 1))
 		echo "$entrynum" > "$entrynum_file"
 	else
