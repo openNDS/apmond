@@ -29,7 +29,7 @@ for LuCI to pick up.
 3. On the router: `apmond show_ap_data` / `apmond show_ap_data all`. `apmond status` on any node shows its role.
 
 `apmond status` reports `checksum` (sha256 of the script the running daemon started from, or of
-`/usr/sbin/apmond` when no daemon runs) and `script_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
+`/usr/sbin/apmond` when no daemon runs) and `installed_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
 If they differ while the daemon runs, `checksum_warning` is added: restart apmond to run the installed version.
 
 See `linux_openwrt/apmond/files/etc/config/apmond` for every option.

@@ -2403,11 +2403,11 @@ show_status() {
 	echo "    \"apmond_version\": \"$(json_str "$version")\","
 	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
 	# checksum: the running daemon's own hash (written at daemon start); the script's hash when no daemon runs.
-	# script_checksum: sha256 of /usr/sbin/apmond on disk now. They differ after an upgrade without a restart.
+	# installed_checksum: sha256 of /usr/sbin/apmond as installed on disk now. They differ after an upgrade without a restart.
 	running_checksum="$checksum"
 	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && read -r running_checksum < "$tmpdir/daemon_checksum"
 	echo "    \"checksum\": \"$(json_str "$running_checksum")\","
-	echo "    \"script_checksum\": \"$checksum\","
+	echo "    \"installed_checksum\": \"$checksum\","
 	[ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ] && echo "    \"checksum_warning\": \"running daemon differs from /usr/sbin/apmond - restart apmond\","
 	echo "    \"enabled\": \"$(json_str "$enabled")\","
 	echo "    \"daemon_running\": \"$running\","
