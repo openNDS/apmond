@@ -28,6 +28,10 @@ for LuCI to pick up.
 2. On every node: `uci set apmond.setup.apmon_seed='my private passphrase'; uci commit apmond; service apmond restart`
 3. On the router: `apmond show_ap_data` / `apmond show_ap_data all`. `apmond status` on any node shows its role.
 
+`apmond status` reports `checksum` (sha256 of the script the running daemon started from, or of
+`/usr/sbin/apmond` when no daemon runs) and `script_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
+If they differ while the daemon runs, `checksum_warning` is added: restart apmond to run the installed version.
+
 See `linux_openwrt/apmond/files/etc/config/apmond` for every option.
 
 ## Wired client bridges

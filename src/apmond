@@ -2392,7 +2392,7 @@ daemon_pid() {
 
 # show_status: JSON, same style as node_status in show_ap_data. Never shows the passphrase or the secret (nor apmon_id, derived from it).
 show_status() {
-	local seed_default="no" b sep pid running="no" ifaces="" i addrs a first aps
+	local seed_default="no" b sep pid running="no" running_checksum ifaces="" i addrs a first aps
 
 	[ "$default_seed_in_use" -eq 1 ] && seed_default="yes"
 	pid=$(daemon_pid) && running="yes"
@@ -2402,7 +2402,13 @@ show_status() {
 	echo "  \"apmond_status\": {"
 	echo "    \"apmond_version\": \"$(json_str "$version")\","
 	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
-	echo "    \"checksum\": \"$checksum\","
+	# checksum: the running daemon's own hash (written at daemon start); the script's hash when no daemon runs.
+	# script_checksum: sha256 of /usr/sbin/apmond on disk now. They differ after an upgrade without a restart.
+	running_checksum="$checksum"
+	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && read -r running_checksum < "$tmpdir/daemon_checksum"
+	echo "    \"checksum\": \"$(json_str "$running_checksum")\","
+	echo "    \"script_checksum\": \"$checksum\","
+	[ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ] && echo "    \"checksum_warning\": \"running daemon differs from /usr/sbin/apmond - restart apmond\","
 	echo "    \"enabled\": \"$(json_str "$enabled")\","
 	echo "    \"daemon_running\": \"$running\","
 	echo "    \"daemon_pid\": \"${pid:-none}\","
@@ -2539,7 +2545,8 @@ run_daemon() {
 	log_datadir
 	last_seed_warning=$(date +%s)
 	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
-	trap 'cleanup_ula; rm -f "$entrynum_file"; exit 0' INT TERM
+	echo "$checksum" > "$tmpdir/daemon_checksum"
+	trap 'cleanup_ula; rm -f "$entrynum_file" "$tmpdir/daemon_checksum"; exit 0' INT TERM
 	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc" "$tmpdir/role"
 	outputfile="$tmpdir/wifidetect"
 	wifi_chipset_detect
@@ -2582,7 +2589,7 @@ case "$1" in
 	send) send_ap_data; exit $?;;
 	read_log) read_log "$2";;
 	detect) get_router_state; manage_ula; echo "$role";;
-	cleanup) cleanup_ula; rm -f "$tmpdir/entrynum";;
+	cleanup) cleanup_ula; rm -f "$tmpdir/entrynum" "$tmpdir/daemon_checksum";;
 	daemon) entrynum_file="$tmpdir/entrynum"; mkdir -p "$tmpdir"; echo 0 > "$entrynum_file"; run_daemon;;
 	write_node_data) write_node_data "$2" "$3"; exit $?;;
 	*) echo "Unknown option [ $1 ]"; show_help; exit 1;;
