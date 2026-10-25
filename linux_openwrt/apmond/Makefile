@@ -7,14 +7,14 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apmond
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=3
+PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Rob White <rob@blue-wave.net>
 PKG_LICENSE:=GPL-2.0-only
 PKG_LICENSE_FILES:=LICENSE
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/opennds/apmond/tar.gz/v$(PKG_VERSION)?
+PKG_SOURCE_URL:=https://codeload.github.com/openNDS/apmond/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=#shasum -a 256 of tar.gz of source files goes here
 
 include $(INCLUDE_DIR)/package.mk
@@ -30,7 +30,7 @@ define Package/apmond
   ifneq ($(CONFIG_USE_APK),)
     EXTRA_DEPENDS:=!mesh11sd (>=0)
   endif
-  URL:=https://github.com/opennds/apmond
+  URL:=https://github.com/openNDS/apmond
 endef
 
 define Package/apmond/description

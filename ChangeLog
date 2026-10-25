@@ -19,6 +19,7 @@ apmond (1.0.0)
   * Add - optional log_mountpoint as mesh11sd, only verified reports are written to it [bluewavenet]
   * Add - router and collector auto detect, first come wins, back off and failover [bluewavenet]
   * Add - IPv6 ULA prefix and report signing secret derived from one passphrase, apmon_seed [bluewavenet]
+  * Add - notice at start and every default_seed_warn_interval (6 hours) while the built-in default passphrase is in use, status shows passphrase_warning [bluewavenet]
   * Add - reports are signed, stale, replayed and tampered reports are rejected [bluewavenet]
   * Add - protocol v1, compatible with mesh11sd apmond [bluewavenet]
   * Add - status, show_ap_data, get_ap_data, send, cleanup, read_log and debuglevel cli commands [bluewavenet]
@@ -30,4 +31,4 @@ apmond (1.0.0)
   * Fix - passphrase is hashed with printf '%s' so % and \ are taken literally [bluewavenet]
   * Fix - race reading /proc/<pid>/cmdline gave can't open errors in status [bluewavenet]
 
- -- Rob White <dot@blue-wave.net>  Sun, 25 Oct 2026 19:00:36 +0000
+ -- Rob White <dot@blue-wave.net>  Sun, 25 Oct 2026 22:42:54 +0000

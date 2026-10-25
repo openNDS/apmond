@@ -107,7 +107,7 @@ grep -q "built-in default passphrase" "$CF" && grep -q "add an apmon_seed option
 sed -n '/^ipv6_canon() {/,/^}/p' "$REPO/src/apmond" > "$W/canon.sh"
 cv=$(busybox sh -c ". $W/canon.sh; ipv6_canon fd46:cfe5:34c5:6ddd:5254:00ff:fe12:3401/64; ipv6_canon fd46:0cfe:0000:6ddd::1/64; ipv6_canon fd46:0:0:1:0:0:0:1; ipv6_canon fd46:1:0:0:5254:0:0:1" | tr '\n' ' ')
 [ "$cv" = "fd46:cfe5:34c5:6ddd:5254:ff:fe12:3401/64 fd46:cfe:0:6ddd::1/64 fd46:0:0:1::1 fd46:1::5254:0:0:1 " ] && ok "ipv6_canon gives the kernel (RFC 5952) form" || ko "ipv6_canon: $cv"
-grep -q "INSTALL_DATA.*etc/config/apmond" "$REPO/linux_openwrt/Makefile" && ! grep -q "INSTALL_CONF" "$REPO/linux_openwrt/Makefile" && ok "Makefile installs /etc/config/apmond 0644 (INSTALL_DATA)" || ko "config install mode"
+grep -q "INSTALL_DATA.*etc/config/apmond" "$REPO/linux_openwrt/apmond/Makefile" && ! grep -q "INSTALL_CONF" "$REPO/linux_openwrt/apmond/Makefile" && ok "Makefile installs /etc/config/apmond 0644 (INSTALL_DATA)" || ko "config install mode"
 mkdir -p "$W/uci-N"; echo "apmond.setup=apmond" > "$W/uci-N/apmond"; echo "network.wan.device='wan-mock'" > "$W/uci-N/network"
 N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/run-N" APMOND_TMP_DATADIR="$W/tmp-N" busybox sh "$REPO/src/apmond" "$@"; }
 : > "$W/log"
@@ -716,8 +716,8 @@ mkdir -p "$W/uci-Q"; printf "apmond.setup=apmond\napmond.setup.cgi_dir='/srv/www
 [ "$(MOCK_UCI_DIR="$W/uci-Q" MOCK_IP_DIR="$W/ip-Q" APMOND_TMPDIR="$W/run-Q" APMOND_TMP_DATADIR="$W/tmp-Q" busybox sh "$REPO/src/apmond" status | jv cgi_dir)" = "/srv/www//cgi-bin/" ] && [ "$(C status | jv cgi_dir)" = "$APMOND_TEST_CGI_DIR/" ] && ok "status shows cgi_dir, normalised to one trailing slash (default when unset)" || ko "status cgi_dir"
 [ "$(busybox sh -c ". '$W/cgi-fns.sh'; norm_dir /; echo \"\$normdir\"; norm_dir /www/cgi-bin; echo \"\$normdir\"; norm_dir /www/cgi-bin/; echo \"\$normdir\"" | tr '\n' ' ')" = "/ /www/cgi-bin/ /www/cgi-bin/ " ] && ok "norm_dir: / stays /, one trailing slash added or kept" || ko "norm_dir"
 grep -q '^[[:space:]]*#option cgi_dir '"'"'/www/cgi-bin'"'" "$CF" && grep -q "web server other than uhttpd" "$CF" && ok "shipped config documents cgi_dir (commented out)" || ko "config cgi_dir"
-MK="$REPO/linux_openwrt/Makefile"
-! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -Eq '^PKG_RELEASE:=[1-9][0-9]*$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE set" || ko "Makefile still installs apmon.cgi"
+MK="$REPO/linux_openwrt/apmond/Makefile"
+! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -q '^PKG_RELEASE:=1$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE 1" || ko "Makefile still installs apmon.cgi"
 sed -n '/^define Package\/apmond\/prerm/,/^endef/p' "$MK" | sed '1d;$d; s/\$\$/$/g' > "$W/prerm.sh"
 busybox sh -n "$W/prerm.sh" && grep -q '^#!/bin/sh' "$W/prerm.sh" && ok "Makefile has a Package/apmond/prerm removal hook (valid sh)" || ko "prerm missing"
 RT="$W/root"; prerm() { rm -rf "$RT"; mkdir -p "$RT/etc/config" "$RT/www/cgi-bin" "$RT/srv/cgi"; [ -n "$1" ] && echo "apmond.setup.cgi_dir='$1'" > "$RT/etc/config/apmond"; }
