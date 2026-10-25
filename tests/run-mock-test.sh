@@ -269,6 +269,21 @@ EVIL=$(printf '{"x":2}' | busybox hexdump -v -e '1/1 "%02x"')
 raw "apmond;evil;$DMAC;begin;0;$TS;$H;$SIG" "$EVIL" >/dev/null
 r=$(raw "apmond;evil;$DMAC;end;${#EVIL};$TS;$H;$SIG"); case "$r" in nack*hash*) ok "tampered payload rejected at end";; *) ko "tamper: $r";; esac
 r=$(raw "apmond;meshnode-1234;$DMAC;begin;0" "$DATA"); case "$r" in nack*) ok "unsigned mesh11sd style report rejected";; *) ko "unsigned: $r";; esac
+# sender side: unreachable collector and rejected reports, with the apmon_seed hint where it applies
+HINT="check that apmon_seed is the same on every node"
+clog() { cat "$W/log" "$W/tmp-C/apmond/apmond_log.log" "$W/tmp-C/apmond_log.log" 2>/dev/null; }
+sleep 1
+MOCK_NODE=C MOCK_UCI_DIR="$W/uci-C" MOCK_IP_DIR="$W/ip-C" APMOND_TMPDIR="$W/run-C" APMOND_TMP_DATADIR="$W/tmp-C" APMOND_TEST_SCHEME=http APMOND_TEST_PORT=1 busybox sh "$REPO/src/apmond" send; rc=$?
+[ "$rc" -ne 0 ] && clog | grep -F "apmond - unable to reach server [ http://[$RULA]:1/" | grep -Eq "\], return code \[ [1-9][0-9]* \] - $HINT\$" && clog | grep "unable to reach server \[ http://\[$RULA\]:1/" | grep -q "daemon\.warn" && ok "unreachable collector: warn line ends with the apmon_seed hint" || ko "unreachable hint $(clog | grep 'unable to reach' | tail -1)"
+cp "$W/uci-R/apmond" "$W/r-seed.bak"; sed -i "s/^apmond.setup.apmon_seed=.*/apmond.setup.apmon_seed='a different passphrase'/" "$W/uci-R/apmond"
+sleep 1; C send; rc=$?
+[ "$rc" -ne 0 ] && clog | grep -q "daemon\.err .*apmond - return code \[ 0 \], send_status \[ nack \], data rejected by server (bad signature) - $HINT\$" && ok "collector rejects the signature (different passphrase): err line with the apmon_seed hint" || ko "bad signature hint $(clog | grep 'rejected by server' | tail -1)"
+cp "$W/r-seed.bak" "$W/uci-R/apmond"; echo "apmond.setup.enabled='0'" >> "$W/uci-R/apmond"; L0=$(wc -l < "$W/log")
+sleep 1; C send; rc=$?
+tail -n +$((L0 + 1)) "$W/log" > "$W/log-nack"
+[ "$rc" -ne 0 ] && grep -q "apmond - return code \[ 0 \], send_status \[ nack \], data rejected by server\$" "$W/log-nack" && ! grep -q "rejected by server.*$HINT" "$W/log-nack" && ok "other nack (collector disabled): no apmon_seed hint" || ko "disabled nack $(grep 'rejected by server' "$W/log-nack" | tail -1)"
+cp "$W/r-seed.bak" "$W/uci-R/apmond"
+sleep 1; C send && ok "report accepted again with the passphrase restored" || ko "send after restore"
 
 echo "== 5. large report, chunked"
 sleep 1

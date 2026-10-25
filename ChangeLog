@@ -8,6 +8,7 @@ apmond (1.0.0)
   * Add - support for vlan_filtering bridges, node and collector addresses use the lan VLAN interface [bluewavenet]
   * Add - wired client byte counts are labelled with "stats_scope": "port" [bluewavenet]
   * Add - status reports the running daemon checksum, the installed checksum and a warning if they differ [bluewavenet]
+  * Add - unreachable collector and bad signature log lines hint to check that apmon_seed is the same on every node [bluewavenet]
   * Add - wired client bridges are auto detected when bridge is unset or auto, wan bridge and vxlan ports skipped [bluewavenet]
   * Add - all JSON output formatted as jq . does [bluewavenet]
   * Add - apmond_checksum in node_status, the sha256 of the apmond script, as mesh11sd_checksum [bluewavenet]

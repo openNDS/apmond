@@ -2182,9 +2182,9 @@ send_ap_data() {
 			fi
 
 			user_agent="apmond;$hostname;$ap_macaddr;$chunkstatus;$strindex;$ts;$payload_hash;$signature"
-			send_status=$(send_request "$user_agent" "")
+			send_reply=$(send_request "$user_agent" "")
 			retcode=$?
-			send_status=$(echo "$send_status" | awk 'NF {printf "%s", $1; exit}')
+			send_status=$(echo "$send_reply" | awk 'NF {printf "%s", $1; exit}')
 			log_debug "apmond - send_ap_data - chunkstatus [ $chunkstatus ], return code [ $retcode ], send_status [ $send_status ]"
 			break
 
@@ -2195,9 +2195,9 @@ send_ap_data() {
 		fi
 
 		user_agent="apmond;$hostname;$ap_macaddr;$chunkstatus;$strindex;$ts;$payload_hash;$signature"
-		send_status=$(send_request "$user_agent" "$chunk")
+		send_reply=$(send_request "$user_agent" "$chunk")
 		retcode=$?
-		send_status=$(echo "$send_status" | awk 'NF {printf "%s", $1; exit}')
+		send_status=$(echo "$send_reply" | awk 'NF {printf "%s", $1; exit}')
 		log_debug "apmond - send_ap_data - chunkstatus [ $chunkstatus ], chunksize [ $chunksize ], return code [ $retcode ], send_status [ $send_status ], sent [ $strindex ]"
 
 		if [ "$apmon_verbose_debug_enable" -eq 1 ]; then
@@ -2212,11 +2212,23 @@ send_ap_data() {
 		strindex=$((strindex+maxchunksize))
 	done
 
+	# The collector address is derived from apmon_seed, so a node with a different passphrase
+	# targets an address nobody holds (wget fails, usually return code 4). If the collector is
+	# reached but rejects the signature, the passphrases differ too. Both get the same hint.
+	seed_hint="check that apmon_seed is the same on every node"
+
 	if [ "$send_status" = "nack" ]; then
-		log_error "apmond - return code [ $retcode ], send_status [ $send_status ], data rejected by server"
+		case "$send_reply" in
+			*"signature"*)
+				log_error "apmond - return code [ $retcode ], send_status [ $send_status ], data rejected by server (bad signature) - $seed_hint"
+			;;
+			*)
+				log_error "apmond - return code [ $retcode ], send_status [ $send_status ], data rejected by server"
+			;;
+		esac
 		retcode=1
 	elif [ "$retcode" -ne 0 ]; then
-		log_warning "apmond - unable to reach server [ $apmon_url ], return code [ $retcode ]"
+		log_warning "apmond - unable to reach server [ $apmon_url ], return code [ $retcode ] - $seed_hint"
 	fi
 
 	echo "last_send=\"$(date)\"; last_status=\"${send_status:-none}\"; last_retcode=\"$retcode\"; last_bytes=\"$hexencoded_len\"" > "$tmpdir/last_send"
