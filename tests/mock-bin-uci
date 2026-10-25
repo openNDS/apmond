@@ -2,6 +2,9 @@
 # Minimal mock of uci: data in $MOCK_UCI_DIR/<config> in "uci show" format,
 # uncommitted changes staged in $MOCK_UCI_DIR/.<config>.changes until "uci commit <config>"
 [ "$1" = "-q" ] && shift
+# -c <confdir> (as uci -c, used by the package removal hook)
+[ "$1" = "-c" ] && { MOCK_UCI_DIR="$2"; shift 2; }
+[ "$1" = "-q" ] && shift
 cmd="$1"; key="$2"; cfg="${key%%.*}"; f="$MOCK_UCI_DIR/$cfg"; c="$MOCK_UCI_DIR/.$cfg.changes"
 case "$cmd" in
 	set) k="${key%%=*}"; v="${key#*=}"; [ -f "$f" ] || exit 1

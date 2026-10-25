@@ -4,7 +4,7 @@
 #  - two simulated nodes with IDENTICAL /etc/config/apmond:
 #      R: wan up with a gateway neighbour -> detected router, takes <ula>::1, is the collector
 #      C: no wan gateway -> peer, sends to <ula>::1
-#  - the collector is busybox httpd running the packaged apmon.cgi, listening on the router's ::1
+#  - the collector is busybox httpd running the apmon.cgi that apmond generates, listening on the router's ::1
 #    (the test adds that address to lo with sudo; apmond's own ip calls go to the mock)
 # Usage: sh tests/run-mock-test.sh
 
@@ -31,6 +31,24 @@ $SUDO ip link add apmdum0 type veth peer name apmdum1 2>/dev/null
 $SUDO ip link set apmdum0 master apmbr0; $SUDO ip link set apmdum0 up; $SUDO ip link set apmdum1 up
 $SUDO bridge fdb add 02:aa:bb:cc:dd:01 dev apmdum0 master static 2>/dev/null
 SPATH="$PATH"
+# every daemon started by the test writes apmon.cgi here instead of the default /www/cgi-bin
+export APMOND_TEST_CGI_DIR="$W/www-default/cgi-bin"
+# kill_matching PATTERN: TERM every process whose command line contains PATTERN (no pkill: neither this
+# host's BusyBox nor OpenWrt's has it), then wait up to 10 s until none is left. Catches the busybox
+# timeout watcher too, whose command line also contains "apmond daemon".
+kill_matching() {
+	local d c i=0 left
+	while :; do
+		left=0
+		for d in /proc/[0-9]*; do
+			[ "${d#/proc/}" = "$$" ] && continue
+			c=$({ tr '\000' ' ' < "$d/cmdline"; } 2>/dev/null)
+			case "$c" in *"$1"*) left=1; kill -TERM "${d#/proc/}" 2>/dev/null;; esac
+		done
+		[ $left -eq 0 ] || [ $i -ge 50 ] && break
+		sleep 0.2; i=$((i+1))
+	done
+}
 export PATH="$W/mock:$W/bb"
 export MOCK_LOG="$W/log" MOCK_NET="$W/net"
 
@@ -186,7 +204,8 @@ grep -E '^[[:space:]]*(echo .*\| *)?uci( -q)? +(set|commit|batch|add|add_list|de
 
 echo "== 3. end to end over the collector ULA"
 PATH="$SPATH" $SUDO ip -6 addr add "$RULA/128" dev lo 2>/dev/null
-sed "s#/usr/sbin/apmond#busybox sh $REPO/src/apmond#" "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" > "$W/www/cgi-bin/apmon.cgi.real"
+# the CGI is the one the section 0 daemon generated, pointed at the repo script
+sed "s#/usr/sbin/apmond#busybox sh $REPO/src/apmond#" "$APMOND_TEST_CGI_DIR/apmon.cgi" > "$W/www/cgi-bin/apmon.cgi.real"
 cat > "$W/www/cgi-bin/apmon.cgi" <<EOC
 #!/bin/sh
 export PATH="$PATH" MOCK_UCI_DIR="$W/uci-R" MOCK_IP_DIR="$W/ip-R" APMOND_TMPDIR="$W/run-R" APMOND_TMP_DATADIR="$W/tmp-R" MOCK_LOG="$W/log"
@@ -471,7 +490,8 @@ DP=$!; i=0; while [ ! -s "$W/run-D/daemon_checksum" ] && [ $i -lt 50 ]; do sleep
 D status > "$W/dc1.json"; [ "$(jv checksum < "$W/dc1.json" 2>/dev/null || D status | jv checksum)" = "$SUM" ] && [ "$(D status | jv installed_checksum)" = "$SUM" ] && ! grep -q checksum_warning "$W/dc1.json" && jqsame "$W/dc1.json" && ok "status: daemon running same script: checksum = installed_checksum, no warning, jq-identical" || ko "status same: $(grep checksum "$W/dc1.json")"
 OLD=0000000000000000000000000000000000000000000000000000000000000abc; echo "$OLD" > "$W/run-D/daemon_checksum"
 D status > "$W/dc2.json"; grep -qx "    \"checksum\": \"$OLD\"," "$W/dc2.json" && grep -qx "    \"installed_checksum\": \"$SUM\"," "$W/dc2.json" && grep -qx '    "checksum_warning": "running daemon differs from /usr/sbin/apmond - restart apmond",' "$W/dc2.json" && jqsame "$W/dc2.json" && json_ok < "$W/dc2.json" && ok "status after upgrade without restart: checksum = running daemon, installed_checksum = disk, checksum_warning" || ko "status differ: $(grep checksum "$W/dc2.json")"
-kill $DP 2>/dev/null; pkill -TERM -f "$REPO/src/apmond daemon" 2>/dev/null; i=0; while [ -f "$W/run-D/daemon_checksum" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+kill $DP 2>/dev/null; kill_matching "$REPO/src/apmond daemon"; wait $DP 2>/dev/null; i=0; while [ -f "$W/run-D/daemon_checksum" ] && [ $i -lt 50 ]; do sleep 0.2; i=$((i+1)); done
+[ -z "$(D status | jv daemon_pid | grep -v '^none$')" ] && ok "test stops the daemon and its timeout watcher without pkill (daemon_pid none)" || ko "daemon still seen: $(D status | jv daemon_pid)"
 [ ! -f "$W/run-D/daemon_checksum" ] && ok "daemon_checksum removed when the daemon stops" || ko "daemon_checksum left after stop"
 echo "$OLD" > "$W/run-D/daemon_checksum"; D status > "$W/dc3.json"; grep -qx "    \"checksum\": \"$SUM\"," "$W/dc3.json" && ! grep -q checksum_warning "$W/dc3.json" && ok "no daemon running: checksum = script hash, stale file ignored, no warning" || ko "not running: $(grep checksum "$W/dc3.json")"
 D cleanup >/dev/null 2>&1; [ ! -f "$W/run-D/daemon_checksum" ] && ok "cleanup removes daemon_checksum" || ko "cleanup daemon_checksum"
@@ -650,6 +670,49 @@ awk '/^daemon_pid\(\) \{/,/^}/' "$REPO/src/apmond" > "$W/dpid.sh"
 : > "$W/dpid.err"; i=0; while [ $i -lt 30 ]; do busybox sh -c ". '$W/dpid.sh'; daemon_pid" >/dev/null 2>>"$W/dpid.err"; i=$((i+1)); done
 wait $CH 2>/dev/null
 [ ! -s "$W/dpid.err" ] && ok "daemon_pid /proc scan silent while processes exit mid-scan" || ko "daemon_pid stderr: $(head -3 "$W/dpid.err")"
+
+echo "== 17. Receiver CGI generated at startup (as mesh11sd setup_apmon_cgi), cgi_dir, removal hook"
+G="$APMOND_TEST_CGI_DIR/apmon.cgi"
+awk '/^norm_dir\(\) \{/,/^}/; /^apmon_cgi\(\) \{/,/^}/; /^file_sha256\(\) \{/,/^}/; /^setup_apmon_cgi\(\) \{/,/^}/' "$REPO/src/apmond" > "$W/cgi-fns.sh"
+busybox sh -c ". '$W/cgi-fns.sh'; apmon_cgi '$W/gen.cgi'"
+[ -f "$G" ] && [ "$(busybox stat -c %a "$G")" = 755 ] && cmp -s "$G" "$W/gen.cgi" && ok "daemon startup wrote apmon.cgi to cgi_dir, mode 755, content = apmon_cgi" || ko "daemon did not write $G"
+grep -q '^# Copyright (C) BlueWave Projects and Services' "$G" && grep -q 'GNU General Public License version 2 or any later version' "$G" && grep -qx '# apmond receiver CGI - generated by apmond at daemon startup, do not edit (rewritten if changed)' "$G" && ! grep -q 'installed by the apmond package' "$G" && ok "generated CGI keeps the licence header and says it is generated by apmond" || ko "CGI header"
+[ "$(head -1 "$G")" = '#!/bin/sh' ] && grep -qx 'printf "%s\\n\\n" "Content-type: text/html"' "$G" && grep -qx 'status=$(/usr/sbin/apmond write_node_data "$node_id" "$querystring")' "$G" && grep -qx 'node_id="$HTTP_USER_AGENT"' "$G" && grep -qx 'querystring="$QUERY_STRING"' "$G" && ok "generated CGI: one header + one blank line (mesh11sd printf quirk fixed), calls /usr/sbin/apmond write_node_data" || ko "CGI body: $(cat "$G")"
+sed 's#/usr/sbin/apmond write_node_data#echo ack#' "$W/gen.cgi" > "$W/gen-ack.cgi"; printf 'Content-type: text/html\n\nack x y\n' > "$W/gen-ack.want"
+HTTP_USER_AGENT=x QUERY_STRING=y busybox sh "$W/gen-ack.cgi" 2>/dev/null | cmp -s - "$W/gen-ack.want" && ok "CGI output is exactly \"Content-type: text/html\", one blank line, then the write_node_data status" || ko "CGI output bytes"
+awk '/^log_datadir\(\) \{/,/^}/' "$REPO/src/apmond" | grep -q 'log_info "apmond - option cgi_dir \[ $cgi_dir \]"' && awk '/^run_daemon\(\) \{/,/^}/' "$REPO/src/apmond" | grep -q '^[[:space:]]*setup_apmon_cgi$' && ok "daemon logs option cgi_dir at info and runs setup_apmon_cgi at startup" || ko "cgi log / startup call"
+# harness: the real functions, logging to a file
+CG="$W/cgi-h"; rm -rf "$CG"; mkdir -p "$CG/run"
+cgh() { busybox env PATH="$W/bb" busybox sh -c "tmpdir='$CG/run'
+log_error() { echo \"ERR \$1\" >> '$CG/log'; }; log_notice() { echo \"NOTICE \$1\" >> '$CG/log'; }; log_info() { echo \"INFO \$1\" >> '$CG/log'; }; log_debug() { echo \"DEBUG \$1\" >> '$CG/log'; }
+. '$W/cgi-fns.sh'; norm_dir '$CG/www/cgi-bin'; default_cgi_dir=\"\$normdir\"; norm_dir '$1'; cgi_dir=\"\$normdir\"; setup_apmon_cgi"; }
+: > "$CG/log"; cgh "$CG/www/cgi-bin"; H="$CG/www/cgi-bin/apmon.cgi"
+[ -f "$H" ] && [ -x "$H" ] && cmp -s "$H" "$W/gen.cgi" && grep -q "^INFO .*receiver CGI written" "$CG/log" && [ ! -f "$CG/run/apmon.cgi" ] && ok "missing cgi_dir created (mkdir -p) and CGI written, temp copy removed" || ko "cgi create: $(cat "$CG/log")"
+touch -d '2026-01-01 00:00:00' "$H"; si=$(busybox stat -c '%i %Y' "$H"); : > "$CG/log"; cgh "$CG/www/cgi-bin"
+[ "$(busybox stat -c '%i %Y' "$H")" = "$si" ] && ! grep -q "NOTICE\|INFO" "$CG/log" && ok "identical CGI left untouched on restart (inode and mtime unchanged)" || ko "identical CGI touched ($si -> $(busybox stat -c '%i %Y' "$H"))"
+echo 'echo hacked' >> "$H"; : > "$CG/log"; cgh "$CG/www/cgi-bin"
+cmp -s "$H" "$W/gen.cgi" && grep -q "^NOTICE .*differed from the generated receiver CGI, rewritten" "$CG/log" && ok "edited CGI rewritten on restart (sha256 differs), notice logged" || ko "edited CGI not repaired"
+chmod 644 "$H"; cgh "$CG/www/cgi-bin"; [ -x "$H" ] && ok "identical CGI that lost its execute bit gets chmod 755" || ko "chmod"
+: > "$CG/log"; cgh "$CG/alt/cgi-bin///"
+[ -f "$CG/alt/cgi-bin/apmon.cgi" ] && cmp -s "$CG/alt/cgi-bin/apmon.cgi" "$W/gen.cgi" && [ ! -e "$H" ] && grep -q "^NOTICE .*removed the old receiver CGI \[ $H \] (cgi_dir is now \[ $CG/alt/cgi-bin/ \])" "$CG/log" && ok "custom cgi_dir (trailing slashes normalised) honoured; our old copy at the default path removed" || ko "custom cgi_dir: $(cat "$CG/log"); $(ls -R "$CG")"
+mkdir -p "$CG/www/cgi-bin"; { cat "$W/gen.cgi"; echo '# local edit'; } > "$H"; cgh "$CG/alt/cgi-bin"
+[ -f "$H" ] && ok "a default-path apmon.cgi that is not exactly the generated one is never removed" || ko "foreign default CGI removed"
+mkdir -p "$W/uci-Q"; printf "apmond.setup=apmond\napmond.setup.cgi_dir='/srv/www//cgi-bin//'\napmond.setup.device='apmbr1'\n" > "$W/uci-Q/apmond"
+[ "$(MOCK_UCI_DIR="$W/uci-Q" MOCK_IP_DIR="$W/ip-Q" APMOND_TMPDIR="$W/run-Q" APMOND_TMP_DATADIR="$W/tmp-Q" busybox sh "$REPO/src/apmond" status | jv cgi_dir)" = "/srv/www//cgi-bin/" ] && [ "$(C status | jv cgi_dir)" = "$APMOND_TEST_CGI_DIR/" ] && ok "status shows cgi_dir, normalised to one trailing slash (default when unset)" || ko "status cgi_dir"
+[ "$(busybox sh -c ". '$W/cgi-fns.sh'; norm_dir /; echo \"\$normdir\"; norm_dir /www/cgi-bin; echo \"\$normdir\"; norm_dir /www/cgi-bin/; echo \"\$normdir\"" | tr '\n' ' ')" = "/ /www/cgi-bin/ /www/cgi-bin/ " ] && ok "norm_dir: / stays /, one trailing slash added or kept" || ko "norm_dir"
+grep -q '^[[:space:]]*#option cgi_dir '"'"'/www/cgi-bin'"'" "$CF" && grep -q "web server other than uhttpd" "$CF" && ok "shipped config documents cgi_dir (commented out)" || ko "config cgi_dir"
+MK="$REPO/linux_openwrt/Makefile"
+! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -q '^PKG_RELEASE:=23$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE 23" || ko "Makefile still installs apmon.cgi"
+sed -n '/^define Package\/apmond\/prerm/,/^endef/p' "$MK" | sed '1d;$d; s/\$\$/$/g' > "$W/prerm.sh"
+busybox sh -n "$W/prerm.sh" && grep -q '^#!/bin/sh' "$W/prerm.sh" && ok "Makefile has a Package/apmond/prerm removal hook (valid sh)" || ko "prerm missing"
+RT="$W/root"; prerm() { rm -rf "$RT"; mkdir -p "$RT/etc/config" "$RT/www/cgi-bin" "$RT/srv/cgi"; [ -n "$1" ] && echo "apmond.setup.cgi_dir='$1'" > "$RT/etc/config/apmond"; }
+prerm ""; cp "$W/gen.cgi" "$RT/www/cgi-bin/apmon.cgi"; IPKG_INSTROOT="$RT" busybox sh "$W/prerm.sh"; r=$?
+[ $r -eq 0 ] && [ ! -e "$RT/www/cgi-bin/apmon.cgi" ] && ok "prerm: cgi_dir unset, generated /www/cgi-bin/apmon.cgi removed, exit 0" || ko "prerm default ($r)"
+prerm "/srv/cgi/"; cp "$W/gen.cgi" "$RT/srv/cgi/apmon.cgi"; cp "$W/gen.cgi" "$RT/www/cgi-bin/apmon.cgi"; IPKG_INSTROOT="$RT" busybox sh "$W/prerm.sh"
+[ ! -e "$RT/srv/cgi/apmon.cgi" ] && [ ! -e "$RT/www/cgi-bin/apmon.cgi" ] && ok "prerm: CGI removed from the configured cgi_dir (read with uci before the config goes) and a leftover default copy" || ko "prerm custom dir"
+prerm "/srv/cgi"; printf '#!/bin/sh\necho someone else\n' > "$RT/srv/cgi/apmon.cgi"; sed 's#/usr/sbin/apmond#/usr/sbin/other#; /generated by apmond/d' "$W/gen.cgi" > "$RT/www/cgi-bin/apmon.cgi"; IPKG_INSTROOT="$RT" busybox sh "$W/prerm.sh"; r=$?
+[ $r -eq 0 ] && [ -f "$RT/srv/cgi/apmon.cgi" ] && [ -f "$RT/www/cgi-bin/apmon.cgi" ] && ok "prerm: an apmon.cgi without the generated-by-apmond marker is left alone" || ko "prerm removed a foreign file ($r)"
+prerm ""; IPKG_INSTROOT="$RT" busybox sh "$W/prerm.sh"; [ $? -eq 0 ] && ok "prerm: nothing to remove, exit 0" || ko "prerm no file"
 
 kill $HTTPD 2>/dev/null
 PATH="$SPATH"
