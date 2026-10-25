@@ -411,7 +411,7 @@ echo "== 9. Collector checks apmond_protocol"
 PT="$W/proto"; mkdir -p "$PT/run"
 awk '/^check_node_protocol\(\) \{/,/^}/' "$REPO/src/apmond" > "$PT/fns.sh"
 hx() { printf '%s' "$1" | busybox hexdump -v -e '1/1 "%02x"'; }
-rep() { hx "{ \"System@02:00:00:0a:00:09\": { \"node_status\": { \"apmond_version\": \"0.1.0\",$1 \"factory_mac\": \"x\" } } }" > "$PT/rep"; }
+rep() { hx "{ \"System@02:00:00:0a:00:09\": { \"node_status\": { \"apmond_version\": \"1.0.0\",$1 \"factory_mac\": \"x\" } } }" > "$PT/rep"; }
 chk() { busybox env PATH="$W/bb" busybox sh -c "tmpdir='$PT/run'; protocol_version=1
 log_error() { echo \"ERR \$1\" >> '$PT/log'; }; log_notice() { echo \"NOTICE \$1\" >> '$PT/log'; }; log_debug() { echo \"DEBUG \$1\" >> '$PT/log'; }
 . '$PT/fns.sh'; check_node_protocol 020000aa0009 '$PT/rep'"; }
@@ -702,7 +702,7 @@ mkdir -p "$W/uci-Q"; printf "apmond.setup=apmond\napmond.setup.cgi_dir='/srv/www
 [ "$(busybox sh -c ". '$W/cgi-fns.sh'; norm_dir /; echo \"\$normdir\"; norm_dir /www/cgi-bin; echo \"\$normdir\"; norm_dir /www/cgi-bin/; echo \"\$normdir\"" | tr '\n' ' ')" = "/ /www/cgi-bin/ /www/cgi-bin/ " ] && ok "norm_dir: / stays /, one trailing slash added or kept" || ko "norm_dir"
 grep -q '^[[:space:]]*#option cgi_dir '"'"'/www/cgi-bin'"'" "$CF" && grep -q "web server other than uhttpd" "$CF" && ok "shipped config documents cgi_dir (commented out)" || ko "config cgi_dir"
 MK="$REPO/linux_openwrt/Makefile"
-! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -q '^PKG_RELEASE:=23$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE 23" || ko "Makefile still installs apmon.cgi"
+! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -q '^PKG_RELEASE:=1$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE 1" || ko "Makefile still installs apmon.cgi"
 sed -n '/^define Package\/apmond\/prerm/,/^endef/p' "$MK" | sed '1d;$d; s/\$\$/$/g' > "$W/prerm.sh"
 busybox sh -n "$W/prerm.sh" && grep -q '^#!/bin/sh' "$W/prerm.sh" && ok "Makefile has a Package/apmond/prerm removal hook (valid sh)" || ko "prerm missing"
 RT="$W/root"; prerm() { rm -rf "$RT"; mkdir -p "$RT/etc/config" "$RT/www/cgi-bin" "$RT/srv/cgi"; [ -n "$1" ] && echo "apmond.setup.cgi_dir='$1'" > "$RT/etc/config/apmond"; }

@@ -17,7 +17,8 @@
 # It never runs uci set/commit or writes any configuration file.
 #
 
-version="0.1.0"
+last_version="0.1.0"
+version="1.0.0"
 protocol_version="1"
 
 # sha256 of the running script, computed once per invocation (as mesh11sd: checksum=$(sha256sum /usr/sbin/mesh11sd ...)).
