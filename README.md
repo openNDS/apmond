@@ -6,7 +6,7 @@ do not use mesh11sd.
 
 Every node (access points and the router) runs the same daemon with an identical
 `/etc/config/apmond`. As in mesh11sd, a shared IPv6 ULA prefix and the report signing secret
-are derived from one memorable passphrase (`apmon_seed`). The node with an upstream wan gateway
+are derived from one passphrase (`apmon_seed`). The node with an upstream wan gateway
 detects itself as the router, takes `<ula_prefix>:<subnet>::1` at runtime and becomes the
 collector; every node sends its report there. Addresses are applied with `ip` at runtime and
 removed on stop; they are never written to UCI. ApmonD never leaves uncommitted UCI changes: a
@@ -17,7 +17,7 @@ for LuCI to pick up.
 
 * Fully compatible with static UCI / LuCI - one section, `config apmond 'setup'`, never written at runtime
 * Works out of the box: every option is optional. Without `apmon_seed` a built-in default passphrase
-  is used, with a critical syslog warning at start and every 6 hours (set your own!)
+  is used, with a syslog notice at start and every 6 hours (set your own to make it more secure)
 * Shared secret authentication (BusyBox `sha256sum` only, no openssl)
 * Same hex-encoded chunked HTTPS transport as mesh11sd (protocol v1, signed)
 * Conflicts with mesh11sd (`CONFLICTS:=mesh11sd`)

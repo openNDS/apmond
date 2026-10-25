@@ -48,7 +48,7 @@ For a mixed network, where some nodes run mesh11sd's built-in apmon and some run
 1. **Protocol field.** mesh11sd adds `"apmond_protocol": "1"` to the `node_status` block it sends, and the same comparison in its collector. ApmonD r9 already treats a report that has `mesh11sd_version` and no protocol field as protocol 1, with a single debug note per node and no warning.
 2. **Signing (the real gap).** mesh11sd reports are unsigned, and the ApmonD collector rejects unsigned reports before the protocol check runs. So a mesh11sd node cannot currently report to an ApmonD collector. Options:
    - mesh11sd adopts ApmonD's signing (same passphrase-derived secret, same signature format), or
-   - the ApmonD collector gets an opt-in option to accept unsigned reports (off by default, with a stern warning like the default-passphrase one), or
+   - the ApmonD collector gets an opt-in option to accept unsigned reports (off by default, with a warning like the default-passphrase notice), or
    - skip interim compatibility and go straight to stage 1.
 
 ## Topologies to consider

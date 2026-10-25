@@ -5,10 +5,10 @@
 # derives its mesh_id and ULA prefix from auto_mesh_id. The router (the node with an upstream wan
 # gateway) is detected automatically and becomes the collector at <ula_prefix>:<subnet>::1.
 #
-# apmon_seed (not set here): a memorable passphrase, identical on every node.
-# While it is not set, a built-in DEFAULT passphrase is used so apmond works out of the box, but this
-# is INSECURE: anyone who knows the default can read and inject access point data. apmond logs a
-# critical warning at start and every 6 hours while the default is in use.
+# apmon_seed (not set here): a passphrase, identical on every node.
+# While it is not set, a built-in default passphrase is used so apmond works out of the box.
+# Make ApmonD more secure by setting your own passphrase. apmond logs a notice at start and
+# every 6 hours while the default is in use.
 # To use your own passphrase, add an apmon_seed option to the setup section (with uci or LuCI)
 # on every node, then restart apmond.
 

@@ -103,7 +103,7 @@ CF="$REPO/linux_openwrt/apmond/files/etc/config/apmond"
 [ -z "$(grep -o 'get_option [a-z_]*' "$REPO/src/apmond" | grep -v 'get_option setup' | grep -v 'get_option()')" ] && ! grep -q "apmond\.\(client\|server\|common\)" "$REPO/src/apmond" "$REPO/linux_openwrt/apmond/files/etc/init.d/apmond" && ok "code reads only apmond.setup.<option>" || ko "non setup options read"
 [ "$(grep -c '^[[:space:]]*option' "$CF")" -eq 0 ] && ok "shipped config: every option commented out" || ko "shipped config has active options"
 ! grep -q "option apmon_seed" "$CF" && ! grep -qi "apmon_seed[[:space:]]*['\"]" "$CF" && ! grep -q "apmon_seed=" "$CF" && ok "shipped config contains no passphrase (no apmon_seed value, active or commented)" || ko "shipped config contains a passphrase"
-grep -q "DEFAULT passphrase" "$CF" && grep -q "add an apmon_seed option" "$CF" && ok "shipped config explains the default passphrase and how to set apmon_seed" || ko "config seed comment"
+grep -q "built-in default passphrase" "$CF" && grep -q "add an apmon_seed option" "$CF" && ok "shipped config explains the default passphrase and how to set apmon_seed" || ko "config seed comment"
 sed -n '/^ipv6_canon() {/,/^}/p' "$REPO/src/apmond" > "$W/canon.sh"
 cv=$(busybox sh -c ". $W/canon.sh; ipv6_canon fd46:cfe5:34c5:6ddd:5254:00ff:fe12:3401/64; ipv6_canon fd46:0cfe:0000:6ddd::1/64; ipv6_canon fd46:0:0:1:0:0:0:1; ipv6_canon fd46:1:0:0:5254:0:0:1" | tr '\n' ' ')
 [ "$cv" = "fd46:cfe5:34c5:6ddd:5254:ff:fe12:3401/64 fd46:cfe:0:6ddd::1/64 fd46:0:0:1::1 fd46:1::5254:0:0:1 " ] && ok "ipv6_canon gives the kernel (RFC 5952) form" || ko "ipv6_canon: $cv"
@@ -114,12 +114,12 @@ N() { MOCK_UCI_DIR="$W/uci-N" MOCK_IP_DIR="$W/ip-N" APMOND_TMPDIR="$W/run-N" APM
 echo "apmond.setup.startup_delay='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.claim_delay_max='0'" >> "$W/uci-N/apmond"; echo "apmond.setup.device='apmbr1'" >> "$W/uci-N/apmond"
 echo "apmond.setup.default_seed_warn_interval='1'" >> "$W/uci-N/apmond"; echo "apmond.setup.interval='10'" >> "$W/uci-N/apmond"
 MOCK_WAN_UP=0 busybox timeout 14 busybox sh -c "MOCK_UCI_DIR=$W/uci-N MOCK_IP_DIR=$W/ip-N APMOND_TMPDIR=$W/run-N APMOND_TMP_DATADIR=$W/tmp-N busybox sh $REPO/src/apmond daemon" 2>/dev/null
-nw=$(grep -c "daemon.crit .*\*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/log")
-[ "$nw" -ge 2 ] && ok "default seed: crit warning at daemon start and repeated periodically ($nw times in 14 s with a 1 s test interval)" || ko "default seed warnings ($nw)"
-grep -q "daemon.crit .*READ and INJECT" "$W/log" && grep -q "daemon.crit .*option apmon_seed in /etc/config/apmond" "$W/log" && ok "warning explains the risk and how to set option apmon_seed" || ko "warning text"
-[ "$(grep -c "daemon.crit apmond\[[0-9]*\]: \[[0-9]*\] \*\*\* WARNING \*\*\* apmond is using the DEFAULT" "$W/tmp-N/apmond_log.log")" -ge 2 ] && ok "default passphrase warning also written to the apmond log file" || ko "crit not in log file"
+nw=$(grep -c "daemon.notice .*apmond is using the built-in default passphrase (apmon_seed). Set your own passphrase to make it more secure." "$W/log")
+[ "$nw" -ge 2 ] && ok "default seed: notice at daemon start and repeated periodically ($nw times in 14 s with a 1 s test interval)" || ko "default seed warnings ($nw)"
+! grep -q "INJECT\|INSECURE" "$W/log" && grep -q "daemon.notice .*option apmon_seed in /etc/config/apmond" "$W/log" && ok "notice explains how to set option apmon_seed (no alarmist wording)" || ko "warning text"
+[ "$(grep -c "daemon.notice apmond\[[0-9]*\]: \[[0-9]*\] apmond is using the built-in default passphrase" "$W/tmp-N/apmond_log.log")" -ge 2 ] && ok "default passphrase notice also written to the apmond log file" || ko "notice not in log file"
 grep -q "add fd" "$W/ip-N/log" 2>/dev/null && ok "default seed: daemon runs normally (ULA applied, report attempted)" || ko "default seed daemon did not run"
-[ "$(N status | jv default_passphrase)" = yes ] && N status | jv passphrase_warning | grep -q INSECURE && ok "status shows the default passphrase is in use" || ko "status default"
+[ "$(N status | jv default_passphrase)" = yes ] && N status | jv passphrase_warning | grep -q "The built-in default passphrase is in use. Make ApmonD more secure" && ok "status shows the default passphrase is in use" || ko "status default"
 echo "apmond.setup.apmon_seed='--__'" >> "$W/uci-N/apmond"
 [ "$(N status | jv default_passphrase)" = yes ] && ok "seed explicitly set to the default is treated as default" || ko "explicit default"
 : > "$W/log"; sed -i "s/apmon_seed='--__'/apmon_seed='private'/" "$W/uci-N/apmond"

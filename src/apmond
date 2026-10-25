@@ -65,7 +65,7 @@ write_to_syslog() {
 
 	case $debugtype in
 		"emerg") debugnum=0; log_to_stderr="-s";;
-		"crit") debugnum=0; log_to_stderr="-s";;	# apmond addition (default passphrase warning)
+		"crit") debugnum=0; log_to_stderr="-s";;	# apmond addition
 		"err") debugnum=0; log_to_stderr="-s";;
 		"notice") debugnum=1; log_to_stderr="";;
 		"warn") debugnum=1; log_to_stderr="-s";;
@@ -190,7 +190,7 @@ load_config() {
 	apmon_verbose_debug_enable=$(get_option setup verbose_debug 0)
 	enabled=$(get_option setup enabled 1)
 	# As mesh11sd auto_mesh_id: if unset, a built-in default seed is used ("--__", the mesh11sd default),
-	# so apmond works out of the box - with a prominent warning (see warn_default_seed)
+	# so apmond works out of the box - with a periodic notice (see warn_default_seed)
 	apmon_seed=$(get_option setup apmon_seed "")
 	default_seed="--__"
 
@@ -2639,7 +2639,7 @@ show_status() {
 	echo "    \"debuglevel\": \"$(json_str "$debuglevel")\","
 	echo "    \"router_detect\": \"$(json_str "$router_detect")\","
 	echo "    \"default_passphrase\": \"$seed_default\","
-	[ "$seed_default" = "yes" ] && echo "    \"passphrase_warning\": \"INSECURE: the default built-in passphrase is in use, anyone knowing it can read/inject AP data. Set option apmon_seed in /etc/config/apmond (the same on every node)\","
+	[ "$seed_default" = "yes" ] && echo "    \"passphrase_warning\": \"The built-in default passphrase is in use. Make ApmonD more secure by setting option apmon_seed in /etc/config/apmond (the same on every node)\","
 
 	if [ -n "$apmon_seed" ]; then
 		get_device_mac
@@ -2708,12 +2708,11 @@ show_status() {
 
 warn_default_seed() {
 	[ "$default_seed_in_use" -eq 1 ] || return 0
-	# Always logged, regardless of debuglevel
+	# Logged at notice level (shown at the default debuglevel 1 and above)
 	for msg in \
-		"*** WARNING *** apmond is using the DEFAULT built-in passphrase (apmon_seed). THIS IS INSECURE." \
-		"*** WARNING *** Anyone who knows the default passphrase can READ and INJECT access point data on this network." \
-		"*** WARNING *** Set the same private passphrase on EVERY node: uci set apmond.setup.apmon_seed='<your passphrase>'; uci commit apmond; service apmond restart (or edit option apmon_seed in /etc/config/apmond)"; do
-		log_crit "$msg"
+		"apmond is using the built-in default passphrase (apmon_seed). Set your own passphrase to make it more secure." \
+		"To set it, on every node: uci set apmond.setup.apmon_seed='<your passphrase>'; uci commit apmond; service apmond restart (or edit option apmon_seed in /etc/config/apmond)"; do
+		log_notice "$msg"
 	done
 }
 
