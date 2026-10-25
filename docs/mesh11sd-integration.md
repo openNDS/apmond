@@ -1,6 +1,6 @@
 # Design note: mesh11sd using ApmonD for AP monitoring
 
-Status: **for later consideration**. Nothing here is implemented. Written Oct 23, 2026, at ApmonD 0.1.0-r9.
+Status: **for later consideration**. Nothing here is implemented. Written Oct 23, 2026, at ApmonD 0.1.0-r9; compatibility notes updated to r22.
 
 ## Background
 
@@ -8,7 +8,7 @@ ApmonD started as a port of the access point monitoring code built into mesh11sd
 
 - the report format (System / phy / node_status / clients JSON),
 - the chunked send to `apmon.cgi` on the collector,
-- the CLI style (`show_ap_data`, `read_log`, `debuglevel`, ...).
+- the CLI style (`show_ap_data`, `get_ap_data`, `read_log`, `debuglevel`, ...).
 
 They have already started to diverge. ApmonD signs its reports with a passphrase-derived secret, uses a passphrase-derived ULA for the collector, reports `apmond_protocol`, and (from r9) checks the protocol on the collector. mesh11sd reports are unsigned, and its `node_status` carries `mesh11sd_version` but no protocol field.
 
@@ -66,6 +66,8 @@ Implications:
 - Wired client entries (ApmonD from r17): every non-local MAC on a bridge port is listed, including other APs and mesh nodes, exactly as mesh11sd's `get_ethernet_clients` does (`brctl showmacs` "is local? no", no peer filtering). `rx_bytes`/`tx_bytes` are the port totals and `rx_bitrate`/`tx_bitrate` the port link speed, shared by all MACs on that port, in both implementations. ApmonD adds `"stats_scope": "port"` after `tx_bitrate`; all other keys are unchanged. mesh11sd will add the same key later; until then a collector must treat a wired entry with no `stats_scope` as `"port"`.
 - VLAN-aware bridges (ApmonD from r18, e.g. the vlan trunk over 802.11s setup): if `device` is a bridge with `vlan_filtering=1`, the id device (ULA addresses, collector `::1`, send/listen) becomes the lan VLAN subinterface (`network.lan.device` / `ifstatus lan` `l3_device`, e.g. `br-lan.10`); an explicit `option device` VLAN subinterface is an override. Bridge detection and MAC tables use the parent bridge. Wired entries get an optional `"vlan": "<vid>[,<vid>...]"` after `stats_scope` (from r20: access ports from the UCI `bridge-vlan` sections, no extra package; per-MAC from `bridge fdb show` when the optional ip-bridge is installed, which also covers trunk ports; one entry per MAC, VIDs comma-joined ascending; ApmonD does not depend on ip-bridge), omitted when the bridge has no vlan_filtering or no VID is known. Purely additive, protocol `1` unchanged; collectors must accept entries with or without `vlan`. mesh11sd's current output (no `vlan`, duplicate MAC keys possible from `brctl showmacs` on a vlan_filtering bridge) is still accepted.
 - Wireless VLANs (ApmonD from r21): wireless station entries get the same optional `"vlan": "<vid>"` after `connected_time` and before `timestamp`, from the AP wifi-iface's network device (`<bridge>.<N>` on a vlan_filtering bridge, e.g. guest on `br-lan.20` -> `"20"`) or, failing that, from the AP interface's single untagged `bridge-vlan` membership. Omitted without vlan_filtering. All other station keys (the iw whitelist) are unchanged and mesh interfaces are never reported as APs, so this stays additive and protocol `1` compatible: mesh11sd output without `vlan` is accepted, and mesh11sd may add the key later in the same position.
+- `apmond get_ap_data` (ApmonD from r22), as mesh11sd's `get_ap_data`: prints this node's own current AP data as JSON in the same shape as a report (`System@<mac>` with `phy`, `node_status` and `clients@<mac>`) and sends nothing. It works on any node, router or peer, so a peer can be checked without the collector, and prints nothing when the node has no clients. `System@` uses the factory MAC, falling back to the device MAC.
+- Script checksum: ApmonD's `node_status` carries `"apmond_checksum"` (sha256 of the apmond script, after `apmond_protocol`), shown on the collector in `show_ap_data` and in `get_ap_data`. `apmond status` shows `checksum` (running daemon) and `installed_checksum` (installed script). mesh11sd reports the same kind of value as `mesh11sd_checksum`; `apmond_checksum` is the shared name for mesh11sd to add alongside it. Additive, protocol `1` unchanged; collectors must accept reports with or without it.
 - Speed reporting must work on both swconfig and DSA switches. ApmonD r5 handles swconfig VLAN ports, and mesh11sd still needs the same fix.
 
 ## Open questions

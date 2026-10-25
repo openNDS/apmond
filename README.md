@@ -35,6 +35,14 @@ for LuCI to pick up.
 `/usr/sbin/apmond` when no daemon runs) and `installed_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
 If they differ while the daemon runs, `checksum_warning` is added: restart apmond to run the installed version.
 
+Every report also carries `"apmond_checksum"` in its `node_status` block, after `apmond_protocol`: the sha256
+(BusyBox `sha256sum`) of the apmond script that produced the report, so a collector can see which build each
+node runs. It appears in each node's entry in `apmond show_ap_data` on the collector and in `apmond get_ap_data`
+output. A report sent by the daemon carries the hash of the script the daemon started from (the same value as
+status `checksum`); `apmond get_ap_data` run by hand gives the hash of `/usr/sbin/apmond` as installed (status
+`installed_checksum`). mesh11sd reports the same value as `mesh11sd_checksum`; `apmond_checksum` is the shared
+field name for mesh11sd to add later, purely additive. A collector should accept reports without it.
+
 See `linux_openwrt/apmond/files/etc/config/apmond` for every option.
 
 ## Wired client bridges
