@@ -702,7 +702,7 @@ mkdir -p "$W/uci-Q"; printf "apmond.setup=apmond\napmond.setup.cgi_dir='/srv/www
 [ "$(busybox sh -c ". '$W/cgi-fns.sh'; norm_dir /; echo \"\$normdir\"; norm_dir /www/cgi-bin; echo \"\$normdir\"; norm_dir /www/cgi-bin/; echo \"\$normdir\"" | tr '\n' ' ')" = "/ /www/cgi-bin/ /www/cgi-bin/ " ] && ok "norm_dir: / stays /, one trailing slash added or kept" || ko "norm_dir"
 grep -q '^[[:space:]]*#option cgi_dir '"'"'/www/cgi-bin'"'" "$CF" && grep -q "web server other than uhttpd" "$CF" && ok "shipped config documents cgi_dir (commented out)" || ko "config cgi_dir"
 MK="$REPO/linux_openwrt/Makefile"
-! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -q '^PKG_RELEASE:=1$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE 1" || ko "Makefile still installs apmon.cgi"
+! sed -n '/^define Package\/apmond\/install/,/^endef/p' "$MK" | grep -q "cgi" && [ ! -e "$REPO/linux_openwrt/apmond/files/www/cgi-bin/apmon.cgi" ] && grep -Eq '^PKG_RELEASE:=[1-9][0-9]*$' "$MK" && ok "apmon.cgi no longer a package file (not in the repo, not installed by the Makefile), PKG_RELEASE set" || ko "Makefile still installs apmon.cgi"
 sed -n '/^define Package\/apmond\/prerm/,/^endef/p' "$MK" | sed '1d;$d; s/\$\$/$/g' > "$W/prerm.sh"
 busybox sh -n "$W/prerm.sh" && grep -q '^#!/bin/sh' "$W/prerm.sh" && ok "Makefile has a Package/apmond/prerm removal hook (valid sh)" || ko "prerm missing"
 RT="$W/root"; prerm() { rm -rf "$RT"; mkdir -p "$RT/etc/config" "$RT/www/cgi-bin" "$RT/srv/cgi"; [ -n "$1" ] && echo "apmond.setup.cgi_dir='$1'" > "$RT/etc/config/apmond"; }
