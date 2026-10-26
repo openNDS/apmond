@@ -1,5 +1,6 @@
 apmond (1.0.1~be7a)
   * Add - -v and --version options print the version, as mesh11sd [bluewavenet]
+  * Add - init script service_data runs apmond -v, as mesh11sd, so service apmond start and restart print the version [bluewavenet]
 
  -- Rob White <dot@blue-wave.net>  Mon, 26 Oct 2026 22:24:23 +0000
 

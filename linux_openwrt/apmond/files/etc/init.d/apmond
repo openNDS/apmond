@@ -18,6 +18,10 @@ USE_PROCD=1
 NAME=apmond
 PROG=/usr/sbin/apmond
 
+service_data() {
+	/usr/sbin/apmond -v
+}
+
 start_service() {
 	mkdir -p /var/run/apmond
 

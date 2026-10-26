@@ -32,6 +32,7 @@ for LuCI to pick up.
    it prints nothing when the node has no clients.
 4. `apmond -v` (or `apmond --version`, `apmond version`) prints the version, `apmond version x.y.z`, as `mesh11sd -v` does.
    It only reads the config, like `apmond status`, and does not touch the running daemon.
+   The init script runs it as `service_data`, as mesh11sd does, so `service apmond start` / `restart` print the version.
 
 `apmond status` reports `checksum` (sha256 of the script the running daemon started from, or of
 `/usr/sbin/apmond` when no daemon runs) and `installed_checksum` (sha256 of `/usr/sbin/apmond` on disk now).
