@@ -20,7 +20,7 @@ for LuCI to pick up.
   is used, with a syslog notice at start and every 6 hours (set your own to make it more secure)
 * Shared secret authentication (BusyBox `sha256sum` only, no openssl)
 * Same hex-encoded chunked HTTPS transport as mesh11sd (protocol v1, signed)
-* Conflicts with mesh11sd (`CONFLICTS:=mesh11sd`)
+* Conflicts with mesh11sd (opkg `CONFLICTS:=mesh11sd`, apk `!mesh11sd` dependency)
 
 ## Quick start
 
