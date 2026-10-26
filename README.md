@@ -30,6 +30,8 @@ for LuCI to pick up.
    `apmond get_ap_data` on any node (router or peer) prints that node's own current access point data as JSON
    (the same `System@<mac>` document it would send, as mesh11sd `get_ap_data`) without sending anything;
    it prints nothing when the node has no clients.
+4. `apmond -v` (or `apmond --version`, `apmond version`) prints the version, `apmond version x.y.z`, as `mesh11sd -v` does.
+   It only reads the config, like `apmond status`, and does not touch the running daemon.
 
 `apmond status` reports `checksum` (sha256 of the script the running daemon started from, or of
 `/usr/sbin/apmond` when no daemon runs) and `installed_checksum` (sha256 of `/usr/sbin/apmond` on disk now).

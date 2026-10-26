@@ -2479,7 +2479,7 @@ show_help() {
   option: help, -h, --help
 	Show this help
 
-  option: version
+  option: version, -v, --version
 	Print the version of apmond
 
   option: status
@@ -2818,7 +2818,7 @@ fi
 
 case "$1" in
 	""|-h|--help|help) show_help;;
-	version) echo "apmond version $version";;
+	version|-v|--version) echo "apmond version $version";;
 	status) show_status;;
 	debuglevel) set_debuglevel "$2"; exit $?;;
 	show_ap_data) show_ap_data "$2";;

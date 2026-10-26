@@ -1,3 +1,8 @@
+apmond (1.0.1~be7a)
+  * Add - -v and --version options print the version, as mesh11sd [bluewavenet]
+
+ -- Rob White <dot@blue-wave.net>  Mon, 26 Oct 2026 22:24:23 +0000
+
 apmond (1.0.0)
   * Add - apmon.cgi is generated at daemon startup and rewritten only if it differs, as mesh11sd does [bluewavenet]
   * Add - cgi_dir option to allow a web server package other than uhttpd, default /www/cgi-bin [bluewavenet]

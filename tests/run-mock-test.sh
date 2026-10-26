@@ -368,6 +368,8 @@ cp "$W/r2.bak" "$W/uci-R/apmond"
 
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
+for o in -v --version; do C $o >/dev/null && [ "$(C $o)" = "$(C version)" ] && C $o | grep -qx 'apmond version [0-9][0-9.]*\(~be7a\)\{0,1\}' && ok "$o prints the version and exits 0, as mesh11sd" || ko "$o: $(C $o)"; done
+[ "$(C -v)" = "apmond version $(sed -n 's/^version="\(.*\)"$/\1/p' "$REPO/src/apmond")" ] && ok "-v reports the version= line of the script" || ko "-v vs version= ($(C -v))"
 [ "$(C status | jv role)" = peer ] && [ "$(R status | jv role)" = router ] && ok "status shows role" || ko "status"
 R status | "$PY" -m json.tool >/dev/null && C status | "$PY" -m json.tool >/dev/null && ok "status output is valid JSON (python json.tool)" || ko "status not JSON"
 { [ -z "$JF" ] || [ "$(R status | jsonfilter -e '@.apmond_status.role')" = router ]; } && ok "status JSON readable with jsonfilter (if present)" || ko "jsonfilter status"
