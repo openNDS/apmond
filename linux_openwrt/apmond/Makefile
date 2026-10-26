@@ -27,9 +27,7 @@ define Package/apmond
   DEPENDS:=+luci-ssl
   # opkg records CONFLICTS; OpenWrt's apk packaging ignores CONFLICTS, so express it as an apk "!" dependency
   CONFLICTS:=mesh11sd
-  ifneq ($(CONFIG_USE_APK),)
-    EXTRA_DEPENDS:=!mesh11sd (>=0)
-  endif
+  EXTRA_DEPENDS:=$(if $(CONFIG_USE_APK),!mesh11sd (>=0))
   URL:=https://github.com/openNDS/apmond
 endef
 
