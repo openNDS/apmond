@@ -1,0 +1,27 @@
+#!/bin/sh
+# Mock of the "ip" calls apmond uses for router detection and runtime ULA addresses.
+# State per simulated node in $MOCK_IP_DIR; a shared "link" registry in $MOCK_NET simulates DAD:
+# adding an address another node ($MOCK_NODE) already holds gives "dadfailed tentative".
+# MOCK_WAN_UP=1 makes the mock wan device "wan-mock" UP with an IPv4 gateway neighbour.
+# Everything else is passed to busybox ip.
+D="${MOCK_IP_DIR:?}"; N="${MOCK_NET:-$D/../net}"; me="${MOCK_NODE:-node}"; mkdir -p "$D" "$N"
+key() { echo "$1" | tr ':/' '__'; }
+# Like the kernel, print addresses without leading zeros in a group (e.g. 00ff -> ff)
+case "$1 $2 $3" in "-6 addr add"|"-6 addr del") op=$3; a=$(echo "$4" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g'); shift 4; set -- -6 addr "$op" "$a" "$@";; esac
+case "$*" in
+	"-6 addr show dev "*) cat "$D/addr_$5" 2>/dev/null; exit 0;;
+	"-6 addr add "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null && exit 2
+		k=$(key "$4"); flags=""
+		if [ -f "$N/$k" ] && [ "$(cat "$N/$k")" != "$me" ]; then flags=" dadfailed tentative"
+		elif [ "${MOCK_DAD_FAIL:-0}" = "1" ]; then flags=" dadfailed tentative"
+		else echo "$me" > "$N/$k"; fi
+		echo "    inet6 $4 scope global$flags" >> "$D/addr_$6"; echo "add $4 $6$flags" >> "$D/log"; exit 0;;
+	"-6 addr del "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null || exit 2
+		grep -v "inet6 $4 " "$D/addr_$6" > "$D/t"; mv "$D/t" "$D/addr_$6"; echo "del $4 $6" >> "$D/log"
+		k=$(key "$4"); [ -f "$N/$k" ] && [ "$(cat "$N/$k")" = "$me" ] && rm -f "$N/$k"; exit 0;;
+	"link show wan-mock")
+		if [ "${MOCK_WAN_UP:-0}" = "1" ]; then echo "9: wan-mock: <BROADCAST,UP,LOWER_UP> mtu 1500 state UP"; else echo "9: wan-mock: <BROADCAST> mtu 1500 state DOWN"; fi; exit 0;;
+	"-6 neigh") exit 0;;
+	"-4 neigh") [ "${MOCK_WAN_UP:-0}" = "1" ] && echo "192.0.2.1 dev wan-mock lladdr 02:00:5e:00:00:01 REACHABLE"; exit 0;;
+esac
+exec busybox ip "$@"

@@ -1,0 +1,2833 @@
+#!/bin/sh
+# Copyright (C) BlueWave Projects and Services 2015-2026
+#
+#	This software is released under the GNU General Public License version 2 or any later version.
+#	This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation,
+#	either version 2 of the License, or (at your option) any later version.
+#
+#	This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#	See the GNU General Public License for more details.
+#
+#	To obtain a copy of the GNU General Public License, see <https://www.gnu.org/licenses/>.
+#
+# apmond - Access Point Monitoring Daemon
+# Standalone port of the apmond functionality of mesh11sd.
+#
+# Static UCI / LuCI compatible: this script only ever READS /etc/config/apmond (and wireless/network/system).
+# It never runs uci set/commit or writes any configuration file.
+#
+
+last_version="0.1.0"
+version="1.0.0"
+protocol_version="1"
+
+# sha256 of the running script, computed once per invocation (as mesh11sd: checksum=$(sha256sum /usr/sbin/mesh11sd ...)).
+# Reported as node_status.apmond_checksum (mesh11sd: mesh11sd_checksum) and status "checksum".
+apmond_script="/usr/sbin/apmond"
+[ -f "$apmond_script" ] || apmond_script="$0"
+checksum=$(sha256sum "$apmond_script" 2>/dev/null | awk '{printf "%s", $1}')
+
+# Volatile runtime state: /var/run/apmond (= /tmp/run/apmond on OpenWrt; mesh11sd/procd use /var/run)
+tmpdir="${APMOND_TMPDIR:-/var/run/apmond}"
+outputfile="$tmpdir/wifidetect"
+cgi_path="/cgi-bin/apmon.cgi"
+
+# Runtime state (role, ULA address list, wifidetect, factory_mac, last_send, staging/, last_ts/) lives in $tmpdir
+# and must not survive a reboot. Only the AP data store (apmond_data/) lives in $datadir (log_mountpoint).
+mkdir -p "$tmpdir" 2>/dev/null
+
+#############################################
+# Logging (same interface as mesh11sd)
+#############################################
+# Port of mesh11sd write_to_syslog (L1529-1585) / write_log (L1466-1524).
+# - messages below debuglevel are dropped; identical consecutive messages are dropped
+# - before the log location is known ($log_mountpoint empty): syslog only
+# - emerg/crit/err/notice: syslog AND the apmond log file; warn/info/debug: log file only
+write_to_syslog() {
+
+	if [ -z "$syslogmessage" ] || [ "$syslogmessage" = "$last_syslogmessage" ]; then
+		syslogmessage=""
+		return 0
+	fi
+
+	if [ -z "$debuglevel" ]; then
+		debuglevel=1
+	fi
+
+	if [ -n "$entrynum_file" ]; then
+		# daemon: counter shared through the run dir, so log calls in $(...) subshells keep it in step
+		[ -f "$entrynum_file" ] && { read -r entrynum < "$entrynum_file"; } 2>/dev/null
+		entrynum=$((${entrynum:-0} + 1))
+		echo "$entrynum" > "$entrynum_file"
+	else
+		entrynum=$((${entrynum:-0} + 1))
+	fi
+
+	case $debugtype in
+		"emerg") debugnum=0; log_to_stderr="-s";;
+		"crit") debugnum=0; log_to_stderr="-s";;	# apmond addition
+		"err") debugnum=0; log_to_stderr="-s";;
+		"notice") debugnum=1; log_to_stderr="";;
+		"warn") debugnum=1; log_to_stderr="-s";;
+		"info") debugnum=2; log_to_stderr="";;
+		"debug") debugnum=3; log_to_stderr="";;
+		*) debugnum=1; debugtype="notice"; log_to_stderr="";;
+	esac
+
+	if [ "$debuglevel" -ge "$debugnum" ]; then
+		logmessage="[$entrynum] $syslogmessage"
+
+		if [ -z "$log_mountpoint" ]; then
+			logger -p "daemon.$debugtype" $log_to_stderr -t "apmond[$$]" "$logmessage" 2>/dev/null
+		else
+			case "$debugtype" in
+				emerg|crit|err|notice) logger -p "daemon.$debugtype" $log_to_stderr -t "apmond[$$]" "$logmessage" 2>/dev/null;;
+			esac
+
+			write_log
+		fi
+
+		last_syslogmessage="$syslogmessage"
+	fi
+
+	syslogmessage=""
+	return 0
+}
+
+write_log() {
+	# Log file: <log_mountpoint>/apmond/apmond_log.log (mesh11sd: $log_mountpoint/mesh11sd/mesh11sd_log.log)
+	local available log_entries
+
+	if [ -n "$log_disabled_reason" ]; then
+		# mesh11sd logs this for every message; apmond once per invocation
+		if [ "$log_disabled_logged" != "1" ]; then
+			log_disabled_logged=1
+			logger -p daemon.err -s -t "apmond[$$]" "$log_disabled_reason" 2>/dev/null
+		fi
+		return 1
+	fi
+
+	mkdir -p "$datadir" 2>/dev/null
+
+	# Truncate the log file to max_log_entries lines
+	log_entries=0
+	[ -f "$logfile" ] && log_entries=$({ wc -l < "$logfile"; } 2>/dev/null)
+	is_uint "$log_entries" || log_entries=0
+
+	if [ "$log_entries" -gt "$max_log_entries" ]; then
+		mv "$logfile" "$logfile.cut" 2>/dev/null
+		tail -n "$max_log_entries" "$logfile.cut" 2>/dev/null >> "$logfile"
+		rm -f "$logfile.cut"
+	fi
+
+	# Free space (KB) on the filesystem holding the log; mesh11sd requires more than 10
+	available=$(df "$datadir" 2>/dev/null | awk 'NR > 1 {v = $(NF-2)} END {print v}')
+	is_uint "$available" || available=0
+
+	if [ "$available" -gt "$min_free_kb" ]; then
+		datetime="$(date) "
+
+		if [ ! -f "$logfile" ]; then
+			echo "$datetime""New log file created" > "$logfile"
+		fi
+
+		echo "$datetime""daemon.$debugtype apmond[$$]: $logmessage" >> "$logfile"
+	else
+		logger -p daemon.err -s -t "apmond[$$]" "Log file too big, please archive contents and reduce max_log_entries" 2>/dev/null
+	fi
+}
+
+read_log() {
+	# mesh11sd read_log [ -f ] (L10562-10577)
+	if [ ! -e "$logfile" ]; then
+		exit 1
+	fi
+
+	if [ -z "$1" ]; then
+		cat "$logfile"
+	elif [ "$1" = "-F" ] || [ "$1" = "-f" ]; then
+		cat "$logfile"
+		rm "$logfile"
+		touch "$logfile"
+		tail -F "$logfile" 2>/dev/null
+	fi
+
+	exit 0
+}
+
+log_error() { syslogmessage="$1"; debugtype="err"; write_to_syslog; }
+log_warning() { syslogmessage="$1"; debugtype="warn"; write_to_syslog; }
+log_notice() { syslogmessage="$1"; debugtype="notice"; write_to_syslog; }
+log_crit() { syslogmessage="$1"; debugtype="crit"; write_to_syslog; }
+log_info() { syslogmessage="$1"; debugtype="info"; write_to_syslog; }
+log_debug() { syslogmessage="$1"; debugtype="debug"; write_to_syslog; }
+
+#############################################
+# Configuration - read only
+#############################################
+get_option() {
+	# $1 section, $2 option, $3 default
+	local val
+	val=$(uci -q get "apmond.$1.$2" 2>/dev/null)
+
+	if [ -z "$val" ]; then
+		val="$3"
+	fi
+
+	echo "$val"
+}
+
+is_uint() {
+	case "$1" in
+		''|*[!0-9]*) return 1;;
+	esac
+	return 0
+}
+
+load_config() {
+	# Every option is optional with a built-in default; apmon_seed should be set (see below).
+	debuglevel=$(get_option setup debuglevel 1)
+	apmon_verbose_debug_enable=$(get_option setup verbose_debug 0)
+	enabled=$(get_option setup enabled 1)
+	# As mesh11sd auto_mesh_id: if unset, a built-in default seed is used ("--__", the mesh11sd default),
+	# so apmond works out of the box - with a periodic notice (see warn_default_seed)
+	apmon_seed=$(get_option setup apmon_seed "")
+	default_seed="--__"
+
+	if [ -z "$apmon_seed" ] || [ "$apmon_seed" = "$default_seed" ]; then
+		apmon_seed="$default_seed"
+		default_seed_in_use=1
+	else
+		default_seed_in_use=0
+	fi
+
+	default_seed_warn_interval=$(get_option setup default_seed_warn_interval 21600)
+	interval=$(get_option setup interval 30)
+	startup_delay=$(get_option setup startup_delay 60)
+	resolve_id_device
+	# bridge is a uci list (list bridge 'br-lan'); uci get returns list values space separated,
+	# and a legacy single "option bridge" still works. Unset: every bridge is auto-detected each pass (detect_bridges)
+	bridge_list=$(get_option setup bridge "")
+	# list bridge 'auto' (alone or with other entries) means the same as unset
+	bridge_auto=1
+	if [ -n "$bridge_list" ]; then
+		case " $bridge_list " in
+			*" auto "*) bridge_list=$(echo " $bridge_list " | sed 's/ auto / /g; s/^ *//; s/ *$//') ;;
+			*) bridge_auto=0 ;;
+		esac
+	fi
+	bridges="$bridge_list"
+	# router_detect (as mesh11sd portal_detect): 1 = auto detect (default), 0 = force router/collector, 2 = force peer
+	router_detect=$(get_option setup router_detect 1)
+	max_age=$(get_option setup max_age 120)
+	max_report_size=$(get_option setup max_report_size 1048576)
+	timeout=10
+	port="${APMOND_TEST_PORT:-443}"
+
+	is_uint "$interval" || interval=30
+	[ "$interval" -lt 10 ] && interval=10
+	is_uint "$startup_delay" || startup_delay=60
+	is_uint "$max_age" || max_age=120
+	is_uint "$max_report_size" || max_report_size=1048576
+	is_uint "$debuglevel" || debuglevel=1
+	is_uint "$apmon_verbose_debug_enable" || apmon_verbose_debug_enable=0
+	is_uint "$router_detect" || router_detect=1
+	router_takeover_misses=$(get_option setup router_takeover_misses 3)
+	is_uint "$router_takeover_misses" || router_takeover_misses=3
+	[ "$router_takeover_misses" -lt 1 ] && router_takeover_misses=1
+	claim_delay_max=$(get_option setup claim_delay_max 10)
+	is_uint "$claim_delay_max" || claim_delay_max=10
+	is_uint "$default_seed_warn_interval" || default_seed_warn_interval=21600
+
+	# cgi_dir (as mesh11sd apmond_cgi_dir): where the daemon writes apmon.cgi, so a web server package
+	# other than uhttpd can be used. Normalised to one trailing slash, as mesh11sd does
+	norm_dir "${APMOND_TEST_CGI_DIR:-/www/cgi-bin}"; default_cgi_dir="$normdir"
+	norm_dir "$(get_option setup cgi_dir "$default_cgi_dir")"; cgi_dir="$normdir"
+
+	resolve_datadir
+	derive_ids
+}
+
+# norm_dir: sets normdir to $1 with every trailing slash stripped, then exactly one added ("/" stays "/")
+norm_dir() {
+	normdir="$1"
+
+	while [ "${normdir%/}" != "$normdir" ]; do
+		normdir="${normdir%/}"
+	done
+
+	normdir="$normdir/"
+}
+
+resolve_datadir() {
+	# Mirrors mesh11sd log_mountpoint (mesh11sd L211-229): default /tmp; if the mountpoint is not
+	# listed by df it falls back to /tmp. Resolved on EVERY invocation (daemon, CGI, CLI) so all use the same path.
+	max_log_entries=$(get_option setup max_log_entries 500)
+	is_uint "$max_log_entries" || max_log_entries=500
+	min_free_kb="${APMOND_TEST_MIN_FREE_KB:-10}"
+	local configured_mountpoint
+	configured_mountpoint=$(get_option setup log_mountpoint /tmp)
+	log_mountpoint=""	# logging is syslog only until the location is resolved
+	configured_mountpoint="${configured_mountpoint%/}"
+	[ -z "$configured_mountpoint" ] && configured_mountpoint="/tmp"
+	lmp="$configured_mountpoint"
+	datadir_reason=""
+
+	if [ "$lmp" != "/tmp" ]; then
+		# mesh11sd: mountcheck=$(df | grep -w "$lmp"). apmond matches the "Mounted on" column exactly,
+		# so e.g. /mnt does not match a line for /mnt/usb
+		mountcheck=$(df 2>/dev/null | awk -v mp="$lmp" '$NF == mp {print $NF}')
+
+		if [ -z "$mountcheck" ]; then
+			datadir_reason="log_mountpoint [ $lmp ] is not mounted - falling back to /tmp"
+			lmp="/tmp"
+		elif ! mkdir -p "$lmp/apmond" 2>/dev/null || ! touch "$lmp/apmond/.wtest" 2>/dev/null; then
+			# apmond addition: mesh11sd does not test writability
+			datadir_reason="log_mountpoint [ $mountcheck ] is not writable - falling back to /tmp"
+			lmp="/tmp"
+		else
+			rm -f "$lmp/apmond/.wtest"
+		fi
+	fi
+
+	# mesh11sd keeps the empty mountcheck after falling back, so file logging stays disabled (write_log L1521-1523)
+	log_disabled_reason=""
+	case "$datadir_reason" in
+		*"not mounted"*) log_disabled_reason="Log location is NOT a mountpoint - logs would fill storage space - logging disabled";;
+	esac
+
+	if [ "$lmp" = "/tmp" ]; then
+		# /tmp is always tmpfs on OpenWrt, so mesh11sd's df check always passes for it
+		datadir="${APMOND_TMP_DATADIR:-/tmp/apmond}"	# test override for the default location
+	else
+		datadir="$lmp/apmond"
+	fi
+
+	mkdir -p "$datadir/apmond_data" "$tmpdir/staging" "$tmpdir/last_ts" 2>/dev/null
+	logfile="$datadir/apmond_log.log"
+	log_mountpoint="$lmp"
+}
+
+#############################################
+# Receiver CGI (as mesh11sd setup_apmon_cgi / apmon_cgi)
+#############################################
+# apmon_cgi: write the receiver CGI to $1. The "generated by apmond" line is the marker the package
+# removal hook looks for, so it only ever deletes a file apmond wrote.
+apmon_cgi() {
+	local cgi="$1"
+
+	[ -n "$cgi" ] || return 1
+
+	cat > "$cgi" <<'EOCGI' || return 1
+#!/bin/sh
+# Copyright (C) BlueWave Projects and Services 2015-2026
+#
+#	This software is released under the GNU General Public License version 2 or any later version.
+#	This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation,
+#	either version 2 of the License, or (at your option) any later version.
+#
+#	This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+#	See the GNU General Public License for more details.
+#
+#	To obtain a copy of the GNU General Public License, see <https://www.gnu.org/licenses/>.
+#
+# apmond receiver CGI - generated by apmond at daemon startup, do not edit (rewritten if changed)
+printf "%s\n\n" "Content-type: text/html"
+node_id="$HTTP_USER_AGENT"
+querystring="$QUERY_STRING"
+status=$(/usr/sbin/apmond write_node_data "$node_id" "$querystring")
+echo "$status"
+EOCGI
+	chmod 755 "$cgi"
+}
+
+file_sha256() {
+	{ sha256sum "$1"; } 2>/dev/null | awk '{printf "%s", $1}'
+}
+
+# setup_apmon_cgi: called once at daemon startup on every node. As mesh11sd: generate the CGI in the
+# run directory, compare sha256 with the live copy and copy over only if it differs or is missing,
+# so an identical copy is left untouched (same inode and mtime).
+setup_apmon_cgi() {
+	local cgi="${cgi_dir}apmon.cgi" tmpcgi="$tmpdir/apmon.cgi" newhash oldhash def
+
+	if [ ! -d "$cgi_dir" ] && ! mkdir -p "$cgi_dir" 2>/dev/null; then
+		log_error "apmond - cannot create cgi_dir [ $cgi_dir ], apmon.cgi not written"
+		return 1
+	fi
+
+	mkdir -p "$tmpdir" 2>/dev/null
+
+	if ! apmon_cgi "$tmpcgi" 2>/dev/null; then
+		log_error "apmond - cannot write [ $tmpcgi ], apmon.cgi not written"
+		return 1
+	fi
+
+	newhash=$(file_sha256 "$tmpcgi")
+
+	if [ -f "$cgi" ]; then
+		oldhash=$(file_sha256 "$cgi")
+
+		if [ "$newhash" != "$oldhash" ]; then
+			if cp "$tmpcgi" "$cgi" 2>/dev/null; then
+				log_notice "apmond - [ $cgi ] differed from the generated receiver CGI, rewritten"
+			else
+				log_error "apmond - cannot rewrite [ $cgi ]"
+			fi
+		else
+			log_debug "apmond - [ $cgi ] is up to date"
+		fi
+		[ -x "$cgi" ] || chmod 755 "$cgi" 2>/dev/null
+	else
+		if cp "$tmpcgi" "$cgi" 2>/dev/null; then
+			chmod 755 "$cgi"
+			log_info "apmond - receiver CGI written to [ $cgi ]"
+		else
+			log_error "apmond - cannot write [ $cgi ]"
+		fi
+	fi
+
+	# cgi_dir moved away from the default: remove our old copy at the default path, only if it is
+	# exactly the generated file (never someone else's file, nor one that was edited)
+	def="${default_cgi_dir}apmon.cgi"
+
+	if [ "$def" != "$cgi" ] && [ -f "$def" ] && [ "$(file_sha256 "$def")" = "$newhash" ]; then
+		rm -f "$def" && log_notice "apmond - removed the old receiver CGI [ $def ] (cgi_dir is now [ $cgi_dir ])"
+	fi
+
+	rm -f "$tmpcgi"
+	return 0
+}
+
+log_datadir() {
+	# Logged by the daemon at start (as mesh11sd logs "option log_mountpoint [ ... ]")
+	[ -n "$datadir_reason" ] && log_warning "apmond - $datadir_reason"
+	log_info "apmond - option log_mountpoint [ $log_mountpoint ], AP data stored in [ $datadir/apmond_data ]"
+	log_info "apmond - option cgi_dir [ $cgi_dir ]"
+}
+
+#############################################
+# Seed derivation (mirrors mesh11sd auto_mesh_id / set_ula_prefix)
+#############################################
+derive_ids() {
+	apmon_id=""
+	apmon_secret=""
+	ula_base=""
+	ula_subnet=""
+	ula_prefix=""
+	router_ula=""
+
+	if [ -z "$apmon_seed" ]; then
+		return 1
+	fi
+
+	# mesh11sd: auto_mesh_id=$(printf "$auto_mesh_id" | sha256sum | awk '{printf "%s", $1}' | tail -c55 | head -c30)
+	# apmond uses printf '%s' so a "%" or "\" in the seed is taken literally
+	seed_hash=$(printf '%s' "$apmon_seed" | sha256sum | awk '{printf "%s", $1}')
+	apmon_id=$(echo -n "$seed_hash" | tail -c55 | head -c30)
+
+	# Shared secret used to key report signatures: the full sha256 of the seed.
+	# (The ULA below only exposes 40 bits of apmon_id on the wire, not the secret.)
+	apmon_secret="$seed_hash"
+
+	# mesh11sd set_ula_prefix: ula_base="fd${id:9:2}:${id:11:4}:${id:15:4}", ula_prefix="$ula_base::/48"
+	first=${apmon_id:9:2}
+	second=${apmon_id:11:4}
+	third=${apmon_id:15:4}
+	ula_base="fd$first:$second:$third"
+	ula_prefix="$ula_base::/48"
+
+	# mesh11sd takes the subnet from the portal's factory MAC hash and peers learn it from RAs.
+	# apmond does not touch odhcpd/RA, so every node must be able to compute it: take it from the seed hash.
+	ula_subnet=${apmon_id:19:4}
+	router_ula=$(ipv6_canon "$ula_base:$ula_subnet::1")
+}
+
+ipv6_canon() {
+	# Print an IPv6 address (optional /len) in the canonical RFC 5952 form the kernel and ip print:
+	# lower case, no leading zeros in a group, the longest run (2+) of zero groups as "::".
+	# Needed so addresses we generate (e.g. "...:5254:00ff:fe12:3401") match "ip -6 addr show" output.
+	echo "$1" | awk '{
+		addr = tolower($0); len = ""
+		if (index(addr, "/")) { len = substr(addr, index(addr, "/")); addr = substr(addr, 1, index(addr, "/") - 1) }
+		# expand to 8 groups
+		dc = index(addr, "::")
+		if (dc) { left = substr(addr, 1, dc - 1); right = substr(addr, dc + 2) } else { left = addr; right = "" }
+		nl = (left == "") ? 0 : split(left, L, ":"); nr = (right == "") ? 0 : split(right, R, ":")
+		out = 0
+		for (i = 1; i <= nl; i++) h[++out] = L[i]
+		if (dc) for (i = 0; i < 8 - nl - nr; i++) h[++out] = "0"
+		for (i = 1; i <= nr; i++) h[++out] = R[i]
+		for (i = 1; i <= 8; i++) { x = h[i]; sub(/^0+/, "", x); if (x == "") x = "0"; h[i] = x }
+		bs = 0; bl = 0; cs = 0; cl = 0
+		for (i = 1; i <= 8; i++) {
+			if (h[i] == "0") { if (cl == 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } } else cl = 0
+		}
+		r = ""
+		for (i = 1; i <= 8; i++) {
+			if (bl >= 2 && i == bs) { r = r "::"; i = bs + bl - 1; continue }
+			if (r != "" && substr(r, length(r)) != ":") r = r ":"
+			r = r h[i]
+		}
+		print r len
+	}'
+}
+
+eui64_iid() {
+	# mesh11sd manage_fallback_ula_route: EUI-64 from the bridge MAC (u/l bit NOT flipped)
+	local mac_no_colons="${1//:/}"
+	local eui64="${mac_no_colons:0:2}${mac_no_colons:2:2}${mac_no_colons:4:2}fffe${mac_no_colons:6:2}${mac_no_colons:8:2}${mac_no_colons:10:2}"
+	echo "${eui64:0:4}:${eui64:4:4}:${eui64:8:4}:${eui64:12:4}"
+}
+
+#############################################
+# Router (collector) detection - port of mesh11sd get_portal_state, portal_detect=1
+#############################################
+get_router_state() {
+	local up_zone default_ipv6_gw default_ipv4_gw
+
+	if [ "$router_detect" -eq 0 ]; then
+		detected_state="router"
+		is_router="forced"
+	elif [ "$router_detect" -eq 2 ]; then
+		detected_state="peer"
+		is_router=""
+	else
+		# Check if router - try to get the upstream default gateway(s)
+		up_zone=$(uci -q get network.wan.device 2>/dev/null | awk '{printf "%s", $1}')
+		[ -z "$up_zone" ] && up_zone=$(uci -q get network.wan.ifname 2>/dev/null | awk '{printf "%s", $1}')
+		default_ipv6_gw=""
+		default_ipv4_gw=""
+
+		if [ -n "$up_zone" ]; then
+
+			if [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UP")" -eq 1 ] || [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UNKNOWN")" -eq 1 ]; then
+				# Look for ipv4 and ipv6 gateways
+				default_ipv6_gw=$(ip -6 neigh | grep "$up_zone" | grep "router" | awk '{print $1}' | awk -F ":" '$1 != "fe80" {print $0}')
+				default_ipv4_gw=$(ip -4 neigh | grep "$up_zone" | awk 'NR==1 {printf "%s", $1}')
+			fi
+		fi
+
+		if [ -n "$default_ipv6_gw" ] || [ -n "$default_ipv4_gw" ]; then
+			is_router="detected"
+			detected_state="router"
+			log_debug "apmond - node has upstream gateway(s), zone [ $up_zone ], [ $default_ipv6_gw ], [ $default_ipv4_gw ]"
+		else
+			is_router=""
+			detected_state="peer"
+		fi
+	fi
+
+	echo "is_router=\"$is_router\"; detected_state=\"$detected_state\"" > "$tmpdir/is_router"
+}
+
+#############################################
+# Runtime ULA addresses (mesh11sd manage_fallback_ula_route) - ip only, never UCI
+#############################################
+ula_addr_add() {
+	# $1 address/len, $2 device
+	if ! ip -6 addr show dev "$2" 2>/dev/null | grep -q "inet6 $1 "; then
+
+		if ip -6 addr add "$1" dev "$2" 2>/dev/null; then
+			log_notice "apmond - ULA address $1 added to $2"
+		else
+			log_error "apmond - failed to add ULA address $1 to $2"
+			return 1
+		fi
+	fi
+
+	grep -qx "$1 $2" "$tmpdir/ula_addrs" 2>/dev/null || echo "$1 $2" >> "$tmpdir/ula_addrs"
+}
+
+ula_addr_del() {
+	# $1 address/len, $2 device
+	if ip -6 addr show dev "$2" 2>/dev/null | grep -q "inet6 $1 "; then
+		ip -6 addr del "$1" dev "$2" 2>/dev/null && log_notice "apmond - ULA address $1 deleted from $2"
+	fi
+
+	if [ -f "$tmpdir/ula_addrs" ]; then
+		grep -vx "$1 $2" "$tmpdir/ula_addrs" > "$tmpdir/ula_addrs.tmp"
+		mv "$tmpdir/ula_addrs.tmp" "$tmpdir/ula_addrs"
+	fi
+}
+
+manage_ula() {
+	[ -n "$ula_base" ] || return 1
+
+	if [ ! -d "/sys/class/net/$id_device" ]; then
+		log_warning "apmond - device [ $id_device ] not found, cannot assign ULA addresses"
+		return 1
+	fi
+
+	get_device_mac
+
+	# Part 1: router ::1 - first come wins (see claim_router_ula)
+	claim_router_ula
+
+	# Part 2: deterministic per node ULA on all nodes (also creates the on-link /64 route)
+	node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")
+	ula_addr_add "$node_ula/64" "$id_device"
+}
+
+#############################################
+# Multi-router handling: first come wins (no RA)
+#############################################
+load_role() {
+	role=""; role_reason=""; ula1_misses=0; claim_delay_done=0
+	[ -f "$tmpdir/role" ] && . "$tmpdir/role"
+	is_uint "$ula1_misses" || ula1_misses=0
+}
+
+set_role() {
+	# $1 role (router|backed-off|peer), $2 reason
+	if [ "$1" != "$role" ]; then
+		log_notice "apmond - role change [ ${role:-none} ] -> [ $1 ]: $2"
+	fi
+
+	role="$1"; role_reason="$2"
+	echo "role=\"$role\"; role_reason=\"$role_reason\"; ula1_misses=\"$ula1_misses\"; claim_delay_done=\"$claim_delay_done\"" > "$tmpdir/role"
+}
+
+holding_router_ula() {
+	ip -6 addr show dev "$id_device" 2>/dev/null | grep -q "inet6 $router_ula/64 "
+}
+
+router_ula_dadfailed() {
+	ip -6 addr show dev "$id_device" 2>/dev/null | grep "inet6 $router_ula/64 " | grep -q "dadfailed"
+}
+
+router_ula_answers() {
+	# Is <ula>::1 in use by another node? (same ping form as mesh11sd ping_portal_diag)
+	ping -c 1 -W 1 "$router_ula" >/dev/null 2>&1
+}
+
+random_delay() {
+	# 0..$1 seconds, BusyBox only
+	local max="$1" r
+	is_uint "$max" || return 0
+	[ "$max" -gt 0 ] || return 0
+	r=$(hexdump -n 2 -e '1/2 "%u"' /dev/urandom 2>/dev/null)
+	is_uint "$r" || r=$(awk 'BEGIN {srand(); printf "%d", rand() * 65535}')
+	sleep $((r % (max + 1)))
+}
+
+claim_router_ula() {
+	load_role
+
+	# Not a router candidate: never hold ::1
+	if [ "$detected_state" != "router" ]; then
+		ula1_misses=0
+
+		if holding_router_ula; then
+			ula_addr_del "$router_ula/64" "$id_device"
+		fi
+
+		set_role "peer" "no upstream gateway detected (router_detect=$router_detect)"
+		return 0
+	fi
+
+	# Already holding ::1: check DAD did not fail
+	if holding_router_ula; then
+
+		if router_ula_dadfailed; then
+			ula_addr_del "$router_ula/64" "$id_device"
+			ula1_misses=0
+			set_role "backed-off" "DAD failed on $router_ula after claiming - another router holds it"
+		else
+			ula1_misses=0
+			set_role "router" "upstream gateway detected and $router_ula claimed (collector)"
+		fi
+
+		return 0
+	fi
+
+	# Router candidate without ::1
+	if router_ula_answers; then
+		ula1_misses=0
+		set_role "backed-off" "upstream gateway detected but $router_ula is already in use by another router"
+		return 0
+	fi
+
+	if [ "$role" = "backed-off" ]; then
+		ula1_misses=$((ula1_misses + 1))
+
+		if [ "$ula1_misses" -lt "$router_takeover_misses" ]; then
+			set_role "backed-off" "$router_ula not answering ($ula1_misses/$router_takeover_misses), waiting before takeover"
+			return 0
+		fi
+
+		log_notice "apmond - $router_ula not answering for $ula1_misses consecutive checks, re-running router detection"
+		get_router_state
+
+		if [ "$detected_state" != "router" ]; then
+			ula1_misses=0
+			set_role "peer" "no upstream gateway detected on recheck"
+			return 0
+		fi
+	fi
+
+	# Small random delay before the first claim to reduce simultaneous claims, then check again
+	if [ "$claim_delay_done" != "1" ]; then
+		claim_delay_done=1
+		random_delay "$claim_delay_max"
+
+		if router_ula_answers; then
+			ula1_misses=0
+			set_role "backed-off" "$router_ula claimed by another router during the startup delay"
+			return 0
+		fi
+	fi
+
+	ula_addr_add "$router_ula/64" "$id_device" || {
+		set_role "backed-off" "failed to add $router_ula"
+		return 1
+	}
+
+	# Wait for DAD to complete (default 1 probe, 1 s), then check the flags
+	local i
+	for i in 1 2 3; do
+		ip -6 addr show dev "$id_device" 2>/dev/null | grep "inet6 $router_ula/64 " | grep -q "tentative" || break
+		router_ula_dadfailed && break
+		sleep 1
+	done
+
+	if router_ula_dadfailed; then
+		ula_addr_del "$router_ula/64" "$id_device"
+		ula1_misses=0
+		set_role "backed-off" "DAD failed on $router_ula - another router holds it"
+		return 0
+	fi
+
+	ula1_misses=0
+	set_role "router" "upstream gateway detected and $router_ula claimed (collector)"
+}
+
+cleanup_ula() {
+	# Remove every address apmond added (recorded in $tmpdir/ula_addrs)
+	if [ -f "$tmpdir/ula_addrs" ]; then
+		while read addr dev; do
+			[ -n "$addr" ] || continue
+			ip -6 addr del "$addr" dev "$dev" 2>/dev/null && log_notice "apmond - ULA address $addr deleted from $dev"
+		done < "$tmpdir/ula_addrs"
+		rm -f "$tmpdir/ula_addrs"
+	fi
+
+	if [ -f "$tmpdir/role" ]; then
+		rm -f "$tmpdir/role"
+	fi
+}
+
+#############################################
+# Generic helpers (from mesh11sd)
+#############################################
+str_to_hex() {
+	local input="$1"
+
+	# Fast path: busybox hexdump (if enabled in the busybox build)
+	if [ -n "$input" ] && hexdump -v -e '1/1 "%02x"' /dev/null >/dev/null 2>&1; then
+		printf '%s' "$input" | hexdump -v -e '1/1 "%02x"' > "$tmpdir/hexencoded"
+		return 0
+	fi
+
+	# Fallback: the original mesh11sd char by char method
+	local i=0
+	local char=""
+	local hex=""
+	local hexstr=""
+	local inputlen=$((${#input}))
+
+	while true; do
+		char=${input:$i:1}
+
+		if [ -z "$char" ]; then
+			break
+		fi
+
+		hex=$(printf "%02x" "'$char")
+		hexstr="$hexstr$hex"
+		i=$((i+1))
+
+		if [ "$i" -ge "$inputlen" ]; then
+			break
+		fi
+	done
+
+	echo -n "$hexstr" > "$tmpdir/hexencoded"
+}
+
+hex_to_str() {
+	local input="$1"
+	local i=0
+	local hex=""
+	local hexstr=""
+	local inputlen=$((${#input}))
+
+	is_hex "$input"
+	retval=$?
+
+	if [ "$retval" -ne 0 ]; then
+		str=""
+		return 1
+	fi
+
+	while true; do
+		hex="\x${input:$i:2}"
+		hexstr="$hexstr$hex"
+		i=$((i+2))
+
+		if [ "$i" -ge "$inputlen" ]; then
+			break
+		fi
+	done
+
+	str=$(printf "$hexstr")
+}
+
+is_hex() {
+	local input="$1"
+
+	if [ -z "$input" ]; then
+		return 1
+	fi
+
+	case "$input" in
+		*[!0-9a-fA-F]*) return 1;;
+	esac
+
+	return 0
+}
+
+sha256_str() {
+	# sha256 of a string, without exposing it on a command line (printf is a shell builtin)
+	printf '%s' "$1" | sha256sum | awk '{printf "%s", $1}'
+}
+
+make_signature() {
+	# $1 secret, $2 mac (as sent), $3 timestamp, $4 payload hash
+	sha256_str "$1|$2|$3|$4"
+}
+
+ms_to_dt() {
+	local time_stamp="$1"
+	local ms=$(echo "$time_stamp" | awk -F "\"" '{printf "%s", $4}')
+	local secs=$(echo "$ms" | head -c 10)
+	date_time="$(date -d "@$secs")"
+	# translate any spaces to underscores
+	date_time=$(echo ${date_time// /_})
+}
+
+#############################################
+# Imported from mesh11sd (unchanged except where marked "apmond:")
+#############################################
+get_factory_mac() {
+	# Sets the global factory_mac (no echo: called in the current shell so its log lines keep the entry counter)
+	local mac=""
+
+	# 1. Preferred: Use system function call - sometimes fails and returns a single newline
+	mac=$([ -f /lib/functions/system.sh ] && . /lib/functions/system.sh && get_mac_label 2>/dev/null)
+	maclen=$((${#mac}))
+
+	if [ -n "$mac" ] && [ "$maclen" -eq 17 ]; then
+		log_info "Factory MAC obtained from system function call: $mac"
+		factory_mac="$mac"
+		return 0
+	fi
+
+	# 2. First fallback: Use the configured WAN device (best on GL.iNet and most routers)
+	local wan_device=$(uci -q get network.wan.device)
+	if [ -n "$wan_device" ]; then
+		mac=$(ip link show "$wan_device" 2>/dev/null | grep -o 'link/ether [^ ]*' | awk '{print $2}')
+		if [ -n "$mac" ]; then
+			log_info "Factory MAC obtained from network.wan.device ($wan_device): $mac"
+			factory_mac="$mac"
+			return 0
+		fi
+	fi
+
+	# 3. Common fallback interfaces (in priority order)
+	for dev in eth1 eth0 lan0 lan1; do
+		mac=$(ip link show "$dev" 2>/dev/null | grep -o 'link/ether [^ ]*' | awk '{print $2}')
+		if [ -n "$mac" ]; then
+			log_info "Factory MAC obtained from fallback interface ($dev): $mac"
+			factory_mac="$mac"
+			return 0
+		fi
+	done
+
+	# 4. Last resort: First Ethernet interface found
+	mac=$(ip -o link show type ether | head -n1 | awk -F': ' '{print $2}' | awk '{print $2}')
+	if [ -n "$mac" ]; then
+		log_info "Factory MAC obtained from first detected Ethernet interface: $mac"
+		factory_mac="$mac"
+		return 0
+	fi
+
+	log_warning "Could not determine factory MAC address"
+	factory_mac=""
+	return 1
+}
+
+write_debug() {
+	echo > /dev/null
+}
+
+wifi_chipset_detect() {
+	# Attempt to get the label mac
+	get_factory_mac; labelmac="$factory_mac"
+	# apmond: no label/factory mac (e.g. x86, VMs): use the device mac, never an empty "System@" key
+	[ -z "$labelmac" ] && { get_device_mac; [ "$device_mac" != "unknown" ] && labelmac="$device_mac"; }
+
+	write_debug "labelmac"
+	labelmac="@$labelmac"
+
+	# apmond: guard the source, a failing "." exits a non-interactive shell
+	[ -f /etc/openwrt_release ] && . /etc/openwrt_release 2>/dev/null
+	echo "{" > "$outputfile"
+	echo "  \"System$labelmac\": {" >> "$outputfile"
+	echo "    \"Distribution\": \"${DISTRIB_ID:-unknown}\"," >> "$outputfile"
+	echo "    \"Release\": \"${DISTRIB_RELEASE:-unknown}\"," >> "$outputfile"
+	echo "    \"Revision\": \"${DISTRIB_REVISION:-unknown}\"," >> "$outputfile"
+	echo "    \"Target\": \"${DISTRIB_TARGET:-unknown}\"," >> "$outputfile"
+	echo "    \"Architecture\": \"${DISTRIB_ARCH:-unknown}\"," >> "$outputfile"
+	echo "    \"Description\": \"${DISTRIB_DESCRIPTION:-unknown}\"," >> "$outputfile"
+
+	if [ -f /etc/board.json ]; then
+		device=$(grep -m1 '"name":' /etc/board.json | sed 's/.*"name": *"\([^"]*\)".*/\1/' 2>/dev/null)
+		if [ -n "$device" ] && ! echo "$device" | grep -Eqw "(WAN|LAN|ACT|LINK|DSL|WLAN|POWER|USB|WPS)"; then
+			echo "    \"Device\": \"$device\"," >> "$outputfile"
+		fi
+	elif [ -f /tmp/sysinfo/model ]; then
+		echo "    \"Device\": \"$(cat /tmp/sysinfo/model)\"," >> "$outputfile"
+	elif [ -f /tmp/sysinfo/board_name ]; then
+		echo "    \"Device\": \"$(cat /tmp/sysinfo/board_name)\"," >> "$outputfile"
+	else
+		echo "    \"Device\": \"unknown\"," >> "$outputfile"
+	fi
+
+	write_debug "device"
+
+	echo "    \"phy\": {" >> "$outputfile"
+
+	for dir in /sys/class/ieee80211/phy* /sys/class/ieee80211/wl*; do
+		[ -d "$dir" ] || continue
+		name="${dir##*/}"
+		phyname="$name"
+		write_debug "phyname"
+		driver=$(awk -F= '/^DRIVER=/ {print $2; exit}' "$dir/device/uevent" 2>/dev/null || echo "n/a")
+		default_driver="$driver"
+		write_debug "default_driver"
+		chipset=""
+
+		# ---------------------------------------------------------------------
+		# Band + 802.11 Standards detection (strict frequency-based for bands)
+		# ---------------------------------------------------------------------
+		phy_info=$(iw phy "$name" info 2>/dev/null)
+		bands=""
+		standards=""
+
+		# Process each Band section
+		for band_num in 1 2 3 4; do
+			if echo "$phy_info" | grep -q "Band ${band_num}:"; then
+				next_band=$((band_num + 1))
+				band_info=$(echo "$phy_info" | sed -n "/Band ${band_num}:/,/Band ${next_band}:/p")
+				# Remove the next Band header if present
+				if echo "$band_info" | grep -q "Band ${next_band}:"; then
+					band_info=$(echo "$band_info" | sed '$d')
+				fi
+
+				# ----- Band detection (frequency only – never invent 6GHz) -----
+				if echo "$band_info" | grep -qE "[* ]+24[0-9]{2}(\.0)? MHz"; then
+					echo "$bands" | grep -qw "2.4GHz" || bands="${bands:+$bands }2.4GHz"
+				fi
+				if echo "$band_info" | grep -qE "[* ]+5[0-9]{3}(\.0)? MHz"; then
+					echo "$bands" | grep -qw "5GHz" || bands="${bands:+$bands }5GHz"
+				fi
+				if echo "$band_info" | grep -qE "[* ]+[6-7][0-9]{3}(\.0)? MHz"; then
+					echo "$bands" | grep -qw "6GHz" || bands="${bands:+$bands }6GHz"
+				fi
+
+				# ----- Standards detection (capability based) -----
+				if echo "$band_info" | grep -qE "HT20|HT40|HT Capabilities|^\s*HT TX/RX MCS"; then
+					echo "$standards" | grep -qw "n" || standards="${standards:+$standards }n"
+				fi
+				if echo "$band_info" | grep -qE "VHT Capabilities|VHT RX MCS|VHT TX MCS|Supported Channel Width:.*(80|160)"; then
+					echo "$standards" | grep -qw "ac" || standards="${standards:+$standards }ac"
+				fi
+				if echo "$band_info" | grep -qE "HE Capabilities|HE MAC Capabilities|HE PHY Capabilities|HE Iftypes|HE RX MCS"; then
+					echo "$standards" | grep -qw "ax" || standards="${standards:+$standards }ax"
+				fi
+				if echo "$band_info" | grep -qE "EHT Capabilities|EHT MAC Capabilities|EHT PHY Capabilities|EHT Iftypes|EHT-MCS Map"; then
+					echo "$standards" | grep -qw "be" || standards="${standards:+$standards }be"
+				fi
+			fi
+		done
+
+		# Fallback if no Band sections were found (rare)
+		if [ -z "$bands" ]; then
+			if echo "$phy_info" | grep -qE "24[0-9]{2}(\.0)? MHz"; then
+				bands="2.4GHz"
+			fi
+			if echo "$phy_info" | grep -qE "5[0-9]{3}(\.0)? MHz"; then
+				[ -n "$bands" ] && bands="$bands 5GHz" || bands="5GHz"
+			fi
+			if echo "$phy_info" | grep -qE "[6-7][0-9]{3}(\.0)? MHz"; then
+				[ -n "$bands" ] && bands="$bands 6GHz" || bands="6GHz"
+			fi
+		fi
+
+		# Safety fallbacks
+		[ -z "$bands" ] && bands="unknown"
+		[ -z "$standards" ] && standards="legacy"
+
+		# Remove "ac" from pure 2.4 GHz PHYs (802.11ac is 5 GHz only)
+		if echo "$bands" | grep -q "2.4GHz" && ! echo "$bands" | grep -qE "5GHz|6GHz"; then
+			standards=$(echo "$standards" | sed 's/ac//g; s/  */ /g; s/^ //; s/ $//')
+		fi
+
+		write_debug "bands"
+		write_debug "standards"
+
+		# Derive friendly Wi-Fi generation
+		wifigen="Legacy"
+		if echo "$standards" | grep -qw "be"; then
+			wifigen="Wi-Fi 7"
+		elif echo "$standards" | grep -qw "ax"; then
+			if echo "$bands" | grep -qw "6GHz"; then
+				wifigen="Wi-Fi 6E"
+			else
+				wifigen="Wi-Fi 6"
+			fi
+		elif echo "$standards" | grep -qw "ac"; then
+			wifigen="Wi-Fi 5"
+		elif echo "$standards" | grep -qw "n"; then
+			wifigen="Wi-Fi 4"
+		fi
+
+		write_debug "wifigen"
+
+		# MIMO / Max spatial streams detection
+		mimo="unknown"
+		max_nss=0
+
+		# Helper to update max NSS
+		update_max_nss() {
+			local nss="$1"
+			[ -n "$nss" ] && [ "$nss" -gt "$max_nss" ] && max_nss="$nss"
+		}
+
+		# HT (802.11n) - MCS max index to NSS
+		ht_mcs=$(echo "$phy_info" | grep "HT TX/RX MCS rate indexes supported" | head -1 | sed -n 's/.*: 0-\([0-9]\+\).*/\1/p')
+		if [ -n "$ht_mcs" ]; then
+			if [ "$ht_mcs" -le 7 ]; then update_max_nss 1
+			elif [ "$ht_mcs" -le 15 ]; then update_max_nss 2
+			elif [ "$ht_mcs" -le 23 ]; then update_max_nss 3
+			elif [ "$ht_mcs" -le 31 ]; then update_max_nss 4
+			elif [ "$ht_mcs" -le 39 ]; then update_max_nss 5
+			elif [ "$ht_mcs" -le 47 ]; then update_max_nss 6
+			elif [ "$ht_mcs" -le 55 ]; then update_max_nss 7
+			elif [ "$ht_mcs" -le 63 ]; then update_max_nss 8
+			fi
+		fi
+
+		# VHT / HE / EHT - highest supported streams (only match "MCS" lines, skip "not supported")
+		for section in "VHT RX MCS" "HE RX MCS" "EHT RX MCS"; do
+			if echo "$phy_info" | grep -q "$section"; then
+				nss_list=$(echo "$phy_info" | grep -A 10 "$section" | \
+						   grep -E "[1-8] streams: MCS" | \
+						   sed 's/.*\([1-8]\) streams: MCS.*/\1/' | \
+						   sort -nr | head -1)
+				update_max_nss "$nss_list"
+			fi
+		done
+
+		# Fallback: antenna bits if nothing else
+		if [ "$max_nss" -eq 0 ] && echo "$phy_info" | grep -q "Available Antennas: TX 0x"; then
+			ant_hex=$(echo "$phy_info" | grep "Available Antennas: TX 0x" | sed 's/.*TX 0x\([0-9a-fA-F]\+\).*/\1/' | tr 'A-F' 'a-f')
+			ant_count=$(printf "%d" "0x$ant_hex" | awk '{popcount=0; n=$1; while(n>0){popcount += n%2; n=int(n/2)} print popcount}')
+			update_max_nss "$ant_count"
+		fi
+
+		# Final MIMO string
+		if [ "$max_nss" -ge 1 ]; then
+			mimo="${max_nss}x${max_nss}"
+		fi
+
+		# Max channel width detection + ChannelWidthCap flag
+		max_width="unknown"
+		channel_width_cap=false
+
+		# Normalize driver name
+		driver_norm=$(echo "$driver" | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+
+		# 1. Practical cap for known over-reporting drivers (mt7615e family reports 160 MHz but unstable)
+		if echo "$driver_norm" | grep -qE "mt7615e|mt7613|mt7663|mt76.*"; then
+			if echo "$bands" | grep -q "5GHz"; then
+				max_width="80 MHz"
+				channel_width_cap=true
+			fi
+		fi
+
+		# 2. If no cap was applied above, use normal detection
+		if [ "$max_width" = "unknown" ]; then
+			# Primary: radar detect widths — robust extraction
+			radar_line=$(echo "$phy_info" | grep -i "radar detect widths:" | head -1)
+
+			if [ -n "$radar_line" ]; then
+				# Extract the highest supported width, including Wi-Fi 7 320 MHz
+				largest=$(echo "$radar_line" | grep -oE "320|240|160|80\+80|80|40|20" | sort -nr | head -1)
+				case "$largest" in
+					320)     max_width="320 MHz" ;;
+					240)     max_width="240 MHz" ;;
+					160)     max_width="160 MHz" ;;
+					"80+80") max_width="80+80 MHz" ;;
+					80)      max_width="80 MHz" ;;
+					40)      max_width="40 MHz" ;;
+					20)      max_width="20 MHz" ;;
+				esac
+			fi
+			# Fallback: explicit capability mentions (for when radar line is missing)
+			if [ "$max_width" = "unknown" ]; then
+				if echo "$phy_info" | grep -qiE "320 MHz|EHT.*320"; then
+					max_width="320 MHz"
+				elif echo "$phy_info" | grep -qiE "160 MHz|HE.*160|EHT.*160|VHT.*160"; then
+					max_width="160 MHz"
+				elif echo "$phy_info" | grep -qiE "80\+80|80 MHz|HE.*80|VHT.*80"; then
+					max_width="80 MHz"
+				elif echo "$phy_info" | grep -qiE "HT40|40 MHz"; then
+					max_width="40 MHz"
+				else
+					max_width="20 MHz"
+				fi
+			fi
+
+			# Wi-Fi 7 EHT 320 MHz detection (radar line may be conservative)
+			if echo "$standards" | grep -q "be" && echo "$phy_info" | grep -qi "320MHz"; then
+				max_width="320 MHz"
+			fi
+
+		fi
+
+		# 3. Safety cap: limit pure 2.4 GHz PHYs to 40 MHz max
+		if echo "$bands" | grep -q "2.4GHz" && ! echo "$bands" | grep -qE "5GHz|6GHz"; then
+			if [ "$max_width" != "20 MHz" ] && [ "$max_width" != "40 MHz" ]; then
+				max_width="40 MHz"
+			fi
+		fi
+
+		# Last resort default
+		[ "$max_width" = "unknown" ] && max_width="20 MHz"
+
+		# Extended Wi-Fi features from "Supported extended features"
+		txqs=false
+		airtime_fairness=false
+		aql=false
+
+		extended_features=$(echo "$phy_info" | grep -A 20 "Supported extended features:" | grep -E "\[.*\]:.*")
+
+		if echo "$extended_features" | grep -q "\[ TXQS \]"; then
+			txqs=true
+		fi
+
+		if echo "$extended_features" | grep -q "\[ AIRTIME_FAIRNESS \]"; then
+			airtime_fairness=true
+		fi
+
+		if echo "$extended_features" | grep -q "\[ AQL \]"; then
+			aql=true
+		fi
+
+		# AQL runtime support check (ath11k exposes via debugfs even if not in "extended features")
+		aql_runtime_support=false
+
+		# Check if debugfs path for this phy exists and has aql_enable file
+		debugfs_path="/sys/kernel/debug/ieee80211/$name"
+		if [ -d "$debugfs_path" ] && [ -f "$debugfs_path/aql_enable" ]; then
+			aql_runtime_support=true
+		fi
+
+		# Antenna count (TX/RX from mask)
+		antennas="unknown"
+		ant_line=$(echo "$phy_info" | grep "Available Antennas: TX 0x" | head -1)
+		if [ -n "$ant_line" ]; then
+			tx_mask=$(echo "$ant_line" | sed -n 's/.*TX 0x\([0-9a-fA-F]\+\).*/\1/p' | tr 'A-F' 'a-f')
+			rx_mask=$(echo "$ant_line" | sed -n 's/.*RX 0x\([0-9a-fA-F]\+\).*/\1/p' | tr 'A-F' 'a-f')
+
+			bitcount() { 
+				local hex="$1"
+				printf "%d" "0x$hex" 2>/dev/null | awk '{c=0; n=$1; while(n>0){c+=n%2; n=int(n/2)} print c}' || echo 0
+			}
+
+			tx_count=$(bitcount "$tx_mask")
+			rx_count=$(bitcount "$rx_mask")
+
+			if [ "$tx_count" -gt 0 ] && [ "$rx_count" -gt 0 ]; then
+				antennas="${tx_count}x${rx_count}"
+			fi
+		fi
+
+		# Fallback: if antenna mask missing (common on rt2800, some mt76), use MIMO value
+		if [ "$antennas" = "unknown" ] && [ "$mimo" != "unknown" ]; then
+			antennas="$mimo"
+		fi
+
+		# Theoretical max throughput per PHY (rough, Mbps) - reference only
+		theoretical_mbps="unknown"
+
+		# Base rate per stream at 40 MHz (realistic, no marketing inflation)
+		base_per_stream=0
+		if echo "$standards" | grep -q "be"; then
+			base_per_stream=360    # Wi-Fi 7 EHT @ 40 MHz per stream (realistic, ~20% over Wi-Fi 6)
+		elif echo "$standards" | grep -q "ax"; then
+			base_per_stream=300    # Wi-Fi 6 HE @ 40 MHz per stream
+		elif echo "$standards" | grep -q "ac"; then
+			base_per_stream=217    # Wi-Fi 5 VHT @ 40 MHz per stream (~433 @ 80 MHz scaled down)
+		elif echo "$standards" | grep -q "n"; then
+			base_per_stream=150    # Wi-Fi 4 HT @ 40 MHz per stream
+		fi
+
+		# Width multiplier scaled by 100 (relative to 40 MHz = 1x)
+		width_mult_scaled=100
+		case "$max_width" in
+			"320 MHz") width_mult_scaled=800 ;;
+			"240 MHz") width_mult_scaled=600 ;;
+			"160 MHz") width_mult_scaled=400 ;;
+			"80 MHz")  width_mult_scaled=200 ;;
+			"40 MHz")  width_mult_scaled=100 ;;
+			"20 MHz")  width_mult_scaled=50 ;;
+			*)         width_mult_scaled=100 ;;
+		esac
+
+		# Streams from MIMO (default 1)
+		streams=1
+		if echo "$mimo" | grep -qE "^[1-8]x[1-8]$"; then
+			streams=$(echo "$mimo" | cut -d'x' -f1)
+			[ "$streams" -eq "$streams" ] 2>/dev/null || streams=1
+		fi
+
+		# Calculate per-PHY theoretical throughput
+		if [ "$base_per_stream" -gt 0 ]; then
+			temp=$(( base_per_stream * streams * width_mult_scaled ))
+			theoretical_mbps=$(( temp / 100 ))
+		fi
+
+		# AggregatedMaxMbps for Wi-Fi 7 MLO (realistic sum of per-band estimates)
+		aggregated_mbps="unknown"
+		if echo "$standards" | grep -q "be"; then
+			# Per-band per-stream rates (consistent scaling from 40 MHz base)
+			rate_24_per_stream=360   # 2.4 GHz @ 40 MHz
+			rate_5_per_stream=1440   # 5 GHz @ 160 MHz (4x)
+			rate_6_per_stream=2880   # 6 GHz @ 320 MHz (8x)
+
+			total_agg=0
+			if echo "$bands" | grep -q "2.4GHz"; then total_agg=$(( total_agg + rate_24_per_stream * streams )); fi
+			if echo "$bands" | grep -q "5GHz"; then total_agg=$(( total_agg + rate_5_per_stream * streams )); fi
+			if echo "$bands" | grep -q "6GHz"; then total_agg=$(( total_agg + rate_6_per_stream * streams )); fi
+
+			if [ "$total_agg" -gt 0 ]; then
+				aggregated_mbps="$total_agg"
+			fi
+		fi
+
+		# 802.11s mesh support detection
+		mesh="no"
+		if echo "$phy_info" | grep -q "mesh point"; then
+			mesh="yes"
+		fi
+
+		write_debug "mesh"
+
+		chipset=$(cat "$dir/device/label" "$dir/device/name" \
+		              "$dir/mac80211/label" "$dir/mac80211/name" 2>/dev/null | head -n1 | xargs)
+
+		default_chipset_detect="$chipset"
+		write_debug "default_chipset_detect"
+
+		# Broadcom brcmfmac
+		if [ -z "$chipset" ] && echo "$driver" | grep -q brcmfmac; then
+			modalias=$({ tr '\0' '\n' < "$dir/device/modalias"; } 2>/dev/null)
+			broadcom_modalias="$modalias"
+			write_debug "broadcom_modalias"
+			fw=$(ls "$dir"/device/firmware/*/brcmfmac* 2>/dev/null | head -n1 | xargs basename 2>/dev/null || true)
+			broadcom_fw="$fw"
+			write_debug "broadcom_fw"
+
+			case "$modalias:$fw" in
+				*bcm4329*|*bcm4330*) chipset="Broadcom BCM4329/BCM4330 (Wi-Fi 4)" ;;
+				*bcm43430*)          chipset="Broadcom BCM43430 (Wi-Fi 5)" ;;
+				*bcm43455*)          chipset="Broadcom BCM43455 (Wi-Fi 5)" ;;
+				*bcm4356*)           chipset="Broadcom BCM4356 (Wi-Fi 5)" ;;
+				*bcm4378*)           chipset="Broadcom BCM4378 (Wi-Fi 6)" ;;
+				*)                   chipset="Broadcom brcmfmac (Wi-Fi)" ;;
+			esac
+
+			broadcom_chipset="$chipset"
+			write_debug "broadcom_chipset"
+		fi
+
+		# MediaTek Filogic / mt79xx family – now includes MT7996 Wi-Fi 7
+		if [ -z "$chipset" ] && [ -f "$dir/device/modalias" ]; then
+			modalias=$({ tr '\0' '\n' < "$dir/device/modalias"; } 2>/dev/null)
+
+			if echo "$modalias" | grep -iq 'mt79'; then
+				filogic_modalias="$modalias"
+				write_debug "filogic_modalias"
+
+				if echo "$modalias" | grep -iq '7996'; then chipset="MediaTek MT7996 (Wi-Fi 7)"
+				elif echo "$modalias" | grep -iq '798'; then chipset="MediaTek Filogic 830/810/880 (MT798x integrated WiFi)"
+				elif echo "$modalias" | grep -iq '7916'; then chipset="MediaTek MT7916 (Wi-Fi 6E)"
+				elif echo "$modalias" | grep -iq '7915'; then chipset="MediaTek MT7915E (Wi-Fi 6)"
+				elif echo "$modalias" | grep -iq '792'; then chipset="MediaTek MT792x"
+				fi
+				filogic_chipset="$chipset"
+				write_debug "filogic_chipset"
+			fi
+
+			if [ -z "$chipset" ] && [ "$driver" = "mt7996e" ]; then
+				chipset="MediaTek MT7996 (Wi-Fi 7)"
+				filogic_chipset="$chipset"
+				write_debug "filogic_chipset"
+			fi
+		fi
+
+		# MediaTek PCIe + USB
+		if [ -z "$chipset" ] && echo "$driver" | grep -q -E 'mt7603e|mt76x2e|mt7915e|mt7615e|mt76x0u'; then
+			mediatek_pcie_usb_driver="$driver"
+			write_debug "mediatek_pcie_usb_driver"
+			case "$driver" in
+				mt7915e) chipset="MediaTek MT7915E (Wi-Fi 6)" ;;
+				mt7615e) chipset="MediaTek MT7615E (Wi-Fi 5)" ;;
+				mt7603e) chipset="MediaTek MT7603E (2.4 GHz)" ;;
+				mt76x2e) chipset="MediaTek MT76x2E (5 GHz)" ;;
+				mt76x0u) chipset="MediaTek MT7610U (Wi-Fi 5 USB) (mt76x0u)" ;;
+			esac
+
+			mediatek_pcie_usb_chipset="$chipset"
+			write_debug "mediatek_pcie_usb_chipset"
+		fi
+
+		# MediaTek SoCs with mt76_wmac
+		if [ -z "$chipset" ] && echo "$driver" | grep -q mt76_wmac; then
+			mediatek_socs_with_mt76_wmac_driver="$driver"
+			write_debug "mediatek_socs_with_mt76_wmac_driver"
+			compat=$(grep -h '^OF_COMPATIBLE_' "$dir"/hwmon/hwmon*/uevent "$dir"/hwmon*/uevent 2>/dev/null | head -n1 | cut -d= -f2)
+			mediatek_socs_with_mt76_wmac_compat="$compat"
+			write_debug "mediatek_socs_with_mt76_wmac_compat"
+
+			case "$compat" in
+				*"mt7628"*) chipset="MediaTek MT7628AN (integrated 2.4 GHz)" ;;
+				*"mt7621"*) chipset="MediaTek MT7621AN/AT (integrated 2.4 GHz)" ;;
+				*"mt7622"*) chipset="MediaTek MT7622 (integrated 2.4/5 GHz)" ;;
+				*)          chipset="" ;;
+			esac
+
+			if [ -z "$chipset" ]; then
+				modalias=$(cat "$dir/device/modalias" 2>/dev/null)
+				mediatek_socs_with_mt76_wmac_modalias="$modalias"
+				write_debug "mediatek_socs_with_mt76_wmac_modalias"
+
+				case "$modalias" in
+					*"mt7628"*) chipset="MediaTek MT7628AN (integrated 2.4 GHz)" ;;
+					*"mt7621"*) chipset="MediaTek MT7621AN/AT (integrated 2.4 GHz)" ;;
+					*"mt7622"*) chipset="MediaTek MT7622 (integrated 2.4/5 GHz)" ;;
+					*)          chipset="Legacy MediaTek mt76_wmac SoC" ;;
+				esac
+			fi
+
+			mediatek_socs_with_mt76_wmac_chipset="$chipset"
+			write_debug "mediatek_socs_with_mt76_wmac_chipset"
+		fi
+
+		# MediaTek Filogic 820/830 integrated (mt7622-wmac – eg. E8450 etc.)
+		if [ -z "$chipset" ] && echo "$driver" | grep -q mt7622-wmac; then
+			chipset="MediaTek MT7622 (integrated 2.4 GHz)"
+
+			filogic_integrated_mt7622_wmac_chipset="$chipset"
+			write_debug "filogic_integrated_mt7622_wmac_chipset"
+		fi
+
+		# MediaTek Ralink rt7620/rt2880
+		if [ -z "$chipset" ] && [ "$driver" = "rt2800_wmac" ]; then
+			chipset="MediaTek Ralink Embedded MT7620-RT2880 series(Wi-Fi 4)"
+			ralink_rt7620_rt2880_chipset="$chipset"
+			write_debug ralink_rt7620_rt2880_chipset
+		fi
+
+		# MediaTek Ralink rt2800pci / rt2800usb
+		if [ -z "$chipset" ] && echo "$driver" | grep -q -E 'rt2800pci|rt2800usb'; then
+			chipset="MediaTek Ralink RT5370/RT3070 (2.4 GHz, Wi-Fi 4)"
+			ralink_rt2800pci_usb_chipset="$chipset"
+			write_debug "ralink_rt2800pci_usb_chipset"
+		fi
+
+		# Realtek rtl8192cu
+		if [ -z "$chipset" ] && echo "$driver" | grep -q rtl8192cu; then
+			chipset="Realtek RTL8192CU (2.4/5 GHz, Wi-Fi 4)"
+			realtek_rtl8192cu_chipset="$chipset"
+			write_debug "realtek_rtl8192cu_chipset"
+		fi
+
+		# Marvell mwlwifi mwifiex_sdio
+		if [ -z "$chipset" ] && echo "$driver" | grep -q -E 'mwlwifi|mwifiex_sdio'; then
+			compat=$(grep -Eh 'PCI_ID|SDIO_ID' "$dir"/device/uevent 2>/dev/null | cut -d= -f2)
+			marvell_mwlwifi_mwifiex_sdio_compat="$compat"
+			write_debug "marvell_mwlwifi_mwifiex_sdio_compat"
+			case "$compat" in
+				"11AB:2A55") chipset="Marvell 88W8864 (2.4/5 GHz, Wi-Fi 5)" ;;
+				"11AB:2B40") chipset="Marvell 88W8964 (2.4/5 GHz, Wi-Fi 5)" ;;
+				"11AB:2B38") chipset="Marvell 88W8897 (2.4/5 GHz, Wi-Fi 5)" ;;
+				"02DF:9135") chipset="Marvell 88W8887 (2.4/5 GHz, Wi-Fi 5)" ;;
+				*) chipset="unknown Marvell Wi-Fi" ;;
+			esac
+
+			marvell_mwlwifi_mwifiex_sdio_chipset="$chipset"
+			write_debug "marvell_mwlwifi_mwifiex_sdio_chipset"
+		fi
+
+		# Qualcomm Atheros – ath9k + ath10k + ath11k + ath12k (Wi-Fi 7)
+		if [ -z "$chipset" ] && echo "$driver" | grep -q -E 'ath9k|ath10k|ath11k|ath12k'; then
+			compat=$(grep -h '^OF_COMPATIBLE_' "$dir"/hwmon/hwmon*/uevent "$dir"/hwmon*/uevent 2>/dev/null | head -n1 | cut -d= -f2)
+
+			if [ -z "$compat" ]; then
+				compat=$(grep -h '^OF_COMPATIBLE_' "$dir"/device/uevent 2>/dev/null | head -n1 | cut -d= -f2)
+			fi
+
+			qualcomm_atheros_ath9k_ath10k_ath11k_compat="$compat"
+			write_debug "qualcomm_atheros_ath9k_ath10k_ath11k_compat"
+
+			modalias=$(cat "$dir/device/modalias" 2>/dev/null)
+			qualcomm_atheros_ath9k_ath10k_ath11k_modalias="$modalias"
+			write_debug "qualcomm_atheros_ath9k_ath10k_ath11k_modalias"
+
+			case "$driver" in
+				ath9k)
+					case "$compat" in
+						*"qca,qca9530-wmac"*) chipset="Qualcomm Atheros AR953x series (2.4 GHz, Wi-Fi 4)" ;;
+						*)                    chipset="" ;;
+					esac
+
+					if [ -z "$chipset" ]; then
+						case "$modalias" in
+							*"953"*) chipset="Qualcomm Atheros QCA9531/QCA9533 (integrated 2.4 GHz)" ;;
+							*"956"*) chipset="Qualcomm Atheros QCA9561/QCA9563 (integrated 2.4 GHz)" ;;
+							*"9556"*) chipset="Qualcomm Atheros QCA9556 (integrated 2.4 GHz)" ;;
+							*"9557"*) chipset="Qualcomm Atheros QCA9557 (integrated 2.4 GHz)" ;;
+							*"9558"*) chipset="Qualcomm Atheros QCA9558 (integrated 2.4 GHz)" ;;
+							*)        chipset="" ;;
+						esac
+					fi
+
+					if [ -z "$chipset" ]; then
+						chipset="Qualcomm Atheros AR93xx/AR92xx/AR5416 series"
+					fi
+				;;
+
+				ath10k_ahb) chipset="Qualcomm Atheros QCA9886 (AHB)" ;;
+				ath10k_pci) chipset="Qualcomm Atheros QCA9984/QCA988x/QCA986x series (PCI)" ;;
+				ath11k)
+					case "$compat" in
+						*"ipq5018-wifi"*) chipset="Qualcomm IPQ5018 integrated 2.4 GHz" ;;
+						*"qcn6122"*)      chipset="Qualcomm QCN6122 (Wi-Fi 6E)" ;;
+						*"qcn9074"*)      chipset="Qualcomm QCN9074" ;;
+						*"ipq6018-wifi"*) chipset="Qualcomm QCN9074" ;;
+						*"ipq807"*)       chipset="Qualcomm QCN9074/QCN5024" ;;
+						*)                chipset="Qualcomm QCN9074/QCN5024" ;;
+					esac
+					;;
+				ath12k_pci|ath12k)
+					chipset="Qualcomm FastConnect 7800 (WCN785x Wi-Fi 7)"
+					;;
+			esac
+
+			qualcomm_atheros_ath9k_ath10k_ath11k_ath12k_chipset="$chipset"
+			write_debug "qualcomm_atheros_ath9k_ath10k_ath11k_ath12k_chipset [ $chipset ]"
+		fi
+
+		[ -z "$chipset" ] && chipset="unknown"
+		echo "      \"$name\": {" >> "$outputfile"
+		echo "        \"Chipset\": \"$chipset\"," >> "$outputfile"
+		echo "        \"Bands\": [" >> "$outputfile"
+
+		for band in $bands; do
+			echo "          \"$band\"," >> "$outputfile"
+		done
+
+		sed -i '$ s/.$//' "$outputfile"
+		echo "        ]," >> "$outputfile"
+
+		echo "        \"Standards\": [" >> "$outputfile"
+
+		for standard in $standards; do
+			echo "          \"802.11$standard\"," >> "$outputfile"
+		done
+
+		sed -i '$ s/.$//' "$outputfile"
+		echo "        ]," >> "$outputfile"
+
+		if [ "$mesh" = "yes" ]; then
+			echo "        \"MeshPoint\": \"802.11s\"," >> "$outputfile"
+		else
+			echo "        \"MeshPoint\": \"N/A\"," >> "$outputfile"
+		fi
+
+		echo "        \"Wi-FiGeneration\": \"$wifigen\"," >> "$outputfile"
+		echo "        \"MIMO\": \"$mimo\"," >> "$outputfile"
+		echo "        \"MaxChannelWidth\": \"$max_width\"," >> "$outputfile"
+		echo "        \"ChannelWidthCap\": $channel_width_cap," >> "$outputfile"
+		echo "        \"Antennas\": \"$antennas\"," >> "$outputfile"
+		echo "        \"TheoreticalMaxMbps\": \"$theoretical_mbps\"," >> "$outputfile"
+
+		if echo "$standards" | grep -q "be"; then
+			echo "        \"Aggregated_MLO_MaxMbps\": \"$aggregated_mbps\"," >> "$outputfile"
+		fi
+
+		echo "        \"TXQS\": $txqs," >> "$outputfile"
+		echo "        \"AIRTIME_FAIRNESS\": $airtime_fairness," >> "$outputfile"
+		echo "        \"AQL_Extended\": $aql," >> "$outputfile"
+		echo "        \"AQL_Runtime\": $aql_runtime_support," >> "$outputfile"
+		echo "        \"Driver\": \"$driver\"" >> "$outputfile"
+		echo "      }," >> "$outputfile"
+	done
+
+	# apmond: only strip the trailing comma if at least one phy was written
+	if [ "$(tail -n 1 "$outputfile")" = "      }," ]; then
+		sed -i '$ s/.$//' "$outputfile"
+		echo "    }" >> "$outputfile"
+	else
+		# no phy: an empty object, written "{}" as jq does
+		sed -i '$ s/{$/{}/' "$outputfile"
+	fi
+	echo "  }" >> "$outputfile"
+	echo "}" >> "$outputfile"
+}
+
+#############################################
+# Data collection (AP / client role)
+#############################################
+get_device_mac() {
+	# Identity of this AP: the MAC of the configured device (default br-lan), falling back to the factory (label) MAC
+	device_mac=""
+
+	if [ -n "$id_device" ] && [ -f "/sys/class/net/$id_device/address" ]; then
+		device_mac=$(cat "/sys/class/net/$id_device/address" 2>/dev/null)
+	fi
+
+	if [ -z "$device_mac" ] || [ "$device_mac" = "00:00:00:00:00:00" ]; then
+		get_cached_factory_mac
+		device_mac="$factory_mac"
+	fi
+
+	device_mac=$(echo "$device_mac" | tr 'A-F' 'a-f')
+}
+
+get_cached_factory_mac() {
+	if [ -f "$tmpdir/factory_mac" ]; then
+		. "$tmpdir/factory_mac"
+	else
+		get_factory_mac
+		echo "factory_mac=\"$factory_mac\"" > "$tmpdir/factory_mac"
+	fi
+
+	[ -z "$factory_mac" ] && factory_mac="unknown"
+}
+
+get_ap_ifname() {
+	# Resolve the real netdev name of a wifi-iface section.
+	# Static configs normally do not set "ifname", so we do not rely on it.
+	# $1 = wifi-iface section name, $2 = ssid
+	local section="$1"
+	local ssid="$2"
+	local name=""
+
+	# 1. netifd runtime state (ubus + jsonfilter, both in base OpenWrt)
+	if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		name=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@[*].interfaces[@.section='$section'].ifname" 2>/dev/null | head -n 1)
+	fi
+
+	# 2. Explicit ifname in the wireless config
+	if [ -z "$name" ]; then
+		name=$(uci -q get wireless."$section".ifname 2>/dev/null)
+	fi
+
+	# 3. Match the ssid against "iw dev" AP interfaces
+	if [ -z "$name" ] && [ -n "$ssid" ]; then
+		name=$(iw dev 2>/dev/null | awk -v ssid="$ssid" '
+			/Interface/ {ifn=$2; s=""; t=""}
+			/^[ \t]*ssid / {sub(/^[ \t]*ssid /, ""); s=$0}
+			/^[ \t]*type / {t=$2; if (t == "AP" && s == ssid) {print ifn; exit}}
+		')
+	fi
+
+	echo "$name"
+}
+
+# ap_vlan <wifi-iface section> <ifname>: VID of an AP interface on a vlan_filtering bridge, "" otherwise.
+# 1. the iface's option network (e.g. guest) has device <bridge>.<N> (br-lan.20) on a vlan_filtering bridge -> N
+# 2. else the ifname is a port of a vlan_filtering bridge with a single untagged VLAN in UCI bridge-vlan
+ap_vlan() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" net dev br vid master
+
+	for net in $(uci -q get wireless."$1".network); do
+		dev=$(uci -q get network."$net".device)
+		case "$dev" in
+			*.*)
+				br=${dev%.*}; vid=${dev##*.}
+				case "$vid" in ''|*[!0-9]*) continue ;; esac
+				[ "$(cat "$sysnet/$br/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && { echo "$vid"; return 0; }
+			;;
+		esac
+	done
+
+	master=$(readlink "$sysnet/$2/master" 2>/dev/null)
+	master=${master##*/}
+	[ -n "$master" ] && [ "$(cat "$sysnet/$master/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_access_vlan "$master" "$2"
+	return 0
+}
+
+get_station_block() {
+	# Parse "iw dev <ifname> station dump" into the mesh11sd apmond JSON format
+	# $1 = ap_ifname, $2 = ap_ssid. Output appended to $tmpdir/apmond_block
+	local ap_ifname="$1"
+	local ap_ssid="$2"
+	local ap_vid="$3"
+
+	iw dev "$ap_ifname" station dump 2>/dev/null > "$tmpdir/stations"
+
+	if [ ! -s "$tmpdir/stations" ]; then
+		rm -f "$tmpdir/stations"
+		return 1
+	fi
+
+	echo "      \"$ap_ssid@$ap_ifname\": {" > "$tmpdir/apmond_block"
+
+	cat "$tmpdir/stations" | while read line; do
+
+		if [ -z "$line" ]; then
+			continue
+		fi
+
+		is_station_id=$(echo "$line" | grep "^Station")
+
+		if [ ! -z "$is_station_id" ]; then
+			echo "$line" | awk '{printf "        \"%s\": {", $2}' >> "$tmpdir/apmond_block"; echo >> "$tmpdir/apmond_block"
+		else
+			ap_param_str=$(echo "$line" | tr -d \\t | tr -d '"' | tr -s " " "_" | awk -F ":" '{printf "\"%s\": \"%s\"", $1, $2}'; echo)
+			ap_param=$(echo "$ap_param_str" | awk -F "\"" '{printf "%s", $2}')
+
+			case $ap_param in
+				"rx_bytes"|"tx_bytes"|"tx_retries"|"signal_avg"|"tx_bitrate"|"rx_bitrate"|"avg_ack_signal"|"connected_time")
+					echo "          $ap_param_str," >> "$tmpdir/apmond_block"
+				;;
+				"current_time")
+					ap_param_str=$(echo -n "$ap_param_str" | sed s/current_time/timestamp/g)
+					[ -n "$ap_vid" ] && echo "          \"vlan\": \"$ap_vid\"," >> "$tmpdir/apmond_block"
+					echo "          $ap_param_str," >> "$tmpdir/apmond_block"
+					ms_to_dt "$ap_param_str"
+					echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
+					echo "        }," >> "$tmpdir/apmond_block"
+				;;
+			esac
+		fi
+	done
+
+	rm -f "$tmpdir/stations"
+	# remove the trailing comma of the last station and close this ap
+	sed -i '$ s/,$//' "$tmpdir/apmond_block"
+	echo "      }" >> "$tmpdir/apmond_block"
+	return 0
+}
+
+append_block() {
+	# Join blocks with a comma separator
+	if [ "$first_block" -eq 1 ]; then
+		first_block=0
+	else
+		sed -i '$ s/$/,/' "$tmpdir/apmond/clients"
+	fi
+
+	cat "$tmpdir/apmond_block" >> "$tmpdir/apmond/clients"
+	rm -f "$tmpdir/apmond_block"
+}
+
+get_ap_data() {
+	mkdir -p "$tmpdir/apmond"
+	aplist=$(uci -q show wireless | grep "\.mode='ap'" | awk -F "." '{printf "%s ", $2}')
+	ap_sta=0
+	eth_sta=0
+	first_block=1
+	get_device_mac
+	clients="clients@$device_mac"
+
+	local lock_timeout=4
+
+	# create a lock file
+	local locked=0
+	for i in $(seq $lock_timeout); do
+		if [ ! -e "$tmpdir/apmond/clients.loc" ]; then
+			touch "$tmpdir/apmond/clients.loc"
+			locked=1
+			break
+		else
+			sleep 1
+		fi
+	done
+
+	# abort if unable to lock
+	if [ "$locked" -eq 0 ]; then
+		return 0
+	fi
+
+	: > "$tmpdir/apmond/clients"
+
+	# Scan around the access point vifs on this node
+	for ap in $aplist; do
+		[ "$(uci -q get wireless."$ap".disabled)" = "1" ] && continue
+		ap_ssid=$(uci -q get wireless."$ap".ssid | tr -d '"\\')
+		ap_ifname=$(get_ap_ifname "$ap" "$ap_ssid")
+
+		if [ -z "$ap_ifname" ]; then
+			log_debug "apmond - could not resolve interface name for wifi-iface [ $ap ], skipping"
+			continue
+		fi
+
+		if get_station_block "$ap_ifname" "$ap_ssid" "$(ap_vlan "$ap" "$ap_ifname")"; then
+			ap_sta=1
+			append_block
+		fi
+	done
+
+	# scan for ethernet connections
+	get_ethernet_clients
+
+	if [ "$ap_sta" -eq 0 ] && [ "$eth_sta" -eq 0 ]; then # don't output the json
+		log_debug "apmond - no clients detected"
+	else
+		usi_full
+		printf '    "%s": {\n' "$clients"
+		cat "$tmpdir/apmond/clients"
+		echo "    }"
+		echo "  }"
+		echo "}"
+	fi
+
+	rm -f "$tmpdir/apmond/clients"
+	# remove the lock file
+	rm -f "$tmpdir/apmond/clients.loc"
+}
+
+# resolve_id_device: sets $id_device (ULA addresses, collector claim, send/listen) and $id_bridge (its bridge,
+# for bridge detection and MAC tables). option device (default br-lan) is used as is, unless it is a bridge
+# with vlan_filtering=1: such a bridge carries no untagged traffic of its own, so the L3 device of the lan
+# network (network.lan.device, else ifstatus lan l3_device) is used when it is a VLAN subinterface
+# <bridge>.<vid> of it, e.g. br-lan.10. An explicit option device 'br-lan.10' also works (override).
+resolve_id_device() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" l3 vid parent
+
+	id_device=$(get_option setup device br-lan)
+	id_bridge=""
+
+	if [ "$(cat "$sysnet/$id_device/bridge/vlan_filtering" 2>/dev/null)" = "1" ]; then
+		for l3 in $(uci -q get network.lan.device) $(ifstatus lan 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); do
+			case "$l3" in
+				"$id_device".*)
+					vid=${l3#"$id_device".}
+					case "$vid" in ''|*[!0-9]*) continue ;; esac
+					id_bridge="$id_device"
+					id_device="$l3"
+					break
+				;;
+			esac
+		done
+	fi
+
+	# A VLAN subinterface of a bridge: bridge detection and MAC tables use the parent bridge
+	case "$id_device" in
+		*.*) parent=${id_device%.*}; [ -d "$sysnet/$parent/bridge" ] && id_bridge="$parent" ;;
+	esac
+	id_bridge=${id_bridge:-$id_device}
+}
+
+# port_access_vlan <bridge> <port>: the VID of an access port of a vlan_filtering bridge, from the UCI
+# bridge-vlan sections (option device <bridge>, option vlan N, list ports '<port>[:u|:t][*]'), so no ip-bridge
+# is needed. Access port = member of exactly one VLAN, untagged (no suffix counts as untagged, as in OpenWrt).
+# Prints nothing for a trunk / multi-VLAN / tagged-only port or a port in no bridge-vlan.
+port_access_vlan() {
+	uci -q show network 2>/dev/null | awk -v br="$1" -v port="$2" '
+		{ eq=index($0, "="); k=substr($0, 1, eq-1); v=substr($0, eq+1); n=split(k, a, ".") }
+		n == 2 && v == "bridge-vlan" { bv[a[2]]=1; next }
+		n == 3 { gsub(/\047/, "", v); f[a[2], a[3]]=v }
+		END {
+			for (sec in bv) {
+				if (f[sec, "device"] != br) continue
+				c=split(f[sec, "ports"], p, " ")
+				for (i=1; i<=c; i++) {
+					m=p[i]; sub(/\*$/, "", m); t="u"
+					if (m ~ /:[ut]$/) { t=substr(m, length(m)); m=substr(m, 1, length(m)-2) }
+					if (m != port) continue
+					mem++
+					if (t == "u") vid=f[sec, "vlan"]; else tagged++
+				}
+			}
+			if (mem == 1 && !tagged && vid ~ /^[0-9]+$/) print vid
+		}'
+}
+
+get_bridge_fdb() {
+	# Output "<ifname> <mac> [<vid>]" for every non-local mac learned on bridge $1.
+	# A vlan_filtering bridge has one fdb entry per MAC and VLAN; the VID is only known from ip-bridge
+	# (bridge fdb show), so it is preferred there. brctl/brforward give no VID.
+	local bridge="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+
+	if [ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && command -v bridge >/dev/null 2>&1; then
+		bridge fdb show br "$bridge" 2>/dev/null | awk '!/permanent/ && !/self/ && $2 == "dev" {v=""; for (i=3; i<NF; i++) if ($i == "vlan") v=$(i+1); print $3, $1, v}'
+	elif command -v brctl >/dev/null 2>&1 && brctl showmacs "$bridge" >/dev/null 2>&1; then
+		# brctl reports a port number, map it to an interface name using sysfs
+		brctl showmacs "$bridge" 2>/dev/null | tail -n +2 | awk '$3 == "no" {print $1, $2}' | while read portno mac; do
+			for brif in "$sysnet"/"$bridge"/brif/*; do
+				[ -f "$brif/port_no" ] || continue
+
+				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
+					echo "${brif##*/} $mac"
+					break
+				fi
+			done
+		done
+	elif [ -r "$sysnet/$bridge/brforward" ] && hexdump -v -e '1/1 "%02x"' /dev/null >/dev/null 2>&1; then
+		# brctl without showmacs (FEATURE_BRCTL_FANCY off): read the kernel fdb directly, as brctl does.
+		# struct __fdb_entry (16 bytes): mac[6] port_no is_local ageing_timer[4] port_hi pad unused[2]
+		hexdump -v -e '16/1 "%02x " "\n"' "$sysnet/$bridge/brforward" 2>/dev/null |
+		awk 'NF == 16 && $8 == "00" {printf "%s:%s:%s:%s:%s:%s %s%s\n", $1, $2, $3, $4, $5, $6, $13, $7}' |
+		while read mac portno; do
+			portno=$((0x$portno))
+			for brif in "$sysnet"/"$bridge"/brif/*; do
+				[ -f "$brif/port_no" ] || continue
+
+				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
+					echo "${brif##*/} $mac"
+					break
+				fi
+			done
+		done
+	elif command -v bridge >/dev/null 2>&1; then
+		# ip-bridge, if installed
+		bridge fdb show br "$bridge" 2>/dev/null | awk '!/permanent/ && !/self/ && $2 == "dev" {print $3, $1}'
+	else
+		log_debug "apmond - neither brctl nor bridge available, skipping ethernet client scan"
+	fi
+}
+
+# wan_devices: the upstream device(s) (network.wan / wan6 device and ifname), "" if wan is disabled.
+# mesh11sd trunk modes (portal_detect 4/5) disable wan and move its port onto br-tun<id> as a LAN port.
+wan_devices() {
+	local w
+
+	wan_devs=" "
+	[ "$(uci -q get network.wan.disabled)" = "1" ] && return 0
+	for w in $(uci -q get network.wan.device) $(uci -q get network.wan.ifname) $(uci -q get network.wan6.device); do
+		case "$wan_devs" in *" $w "*) ;; *) wan_devs="$wan_devs$w " ;; esac
+	done
+}
+
+# detect_bridges: sets $bridges. With list bridge set, the list as configured. Otherwise every bridge in sysfs
+# (device first), except the upstream bridge (it is, or has as a member, the wan device) and bridges with no
+# member other than mesh11sd vxlan tunnel ports (nothing wired to scan). Cheap: one sysfs glob, three uci reads.
+detect_bridges() {
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" d br brif m members up found=""
+
+	if [ "$bridge_auto" -ne 1 ]; then
+		bridges="$bridge_list"
+		return 0
+	fi
+
+	wan_devices
+
+	# VLAN subinterfaces (br-lan.10) have no bridge/ dir, so they are never taken as separate bridges
+	for d in "$sysnet/${id_bridge:-$id_device}/bridge" "$sysnet"/*/bridge; do
+		[ -d "$d" ] || continue
+		br=${d%/bridge}; br=${br##*/}
+		case " $found " in *" $br "*) continue ;; esac
+		case "$wan_devs" in *" $br "*) continue ;; esac
+		members=0; up=0
+
+		for brif in "$sysnet/$br"/brif/*; do
+			[ -e "$brif" ] || continue
+			m=${brif##*/}
+			case "$wan_devs" in *" $m "*) up=1; break ;; esac
+			case "$m" in vxlan*) continue ;; esac
+			members=$((members+1))
+		done
+
+		[ "$up" -eq 0 ] && [ "$members" -gt 0 ] && found="${found:+$found }$br"
+	done
+
+	bridges="$found"
+}
+
+get_ethernet_clients() {
+	local first=1 sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+
+	detect_bridges
+	wan_devices
+
+	for bridge in $bridges; do
+		[ -d "$sysnet/$bridge/bridge" ] || continue
+
+		# Ports from the static network config, if listed, otherwise all wired bridge members
+		net_device=$(uci -q show network | grep "\.name='$bridge'" | head -n 1 | awk -F "." '{printf "%s.%s", $1, $2}')
+		bridge_ports=""
+		[ -n "$net_device" ] && bridge_ports=$(uci -q get "$net_device.ports")
+
+		if [ -z "$bridge_ports" ]; then
+			for brif in "$sysnet"/"$bridge"/brif/*; do
+				[ -e "$brif" ] || continue
+				bridge_ports="$bridge_ports ${brif##*/}"
+			done
+		fi
+
+		get_bridge_fdb "$bridge" > "$tmpdir/fdb"
+
+		for port in $bridge_ports; do
+			# wireless clients are reported from iw station dump
+			if [ -e "$sysnet/$port/phy80211" ] || [ -e "$sysnet/$port/wireless" ]; then
+				continue
+			fi
+			# mesh11sd vxlan tunnel port: its macs are other nodes' clients (as mesh11sd get_ethernet_clients); upstream port
+			case "$port" in vxlan*) continue ;; esac
+			case "$wan_devs" in *" $port "*) continue ;; esac
+
+			# One entry per MAC (a JSON key can't repeat): a MAC seen in several VLANs gets its VIDs comma-joined, ascending
+			macs=$(awk -v p="$port" '$1 == p {
+				if (!($2 in v)) { o[++n]=$2; v[$2]="" }
+				if ($3 != "" && index("," v[$2] ",", "," $3 ",") == 0) v[$2]=(v[$2] == "" ? $3 : v[$2] "," $3)
+			} END {
+				for (i=1; i<=n; i++) {
+					c=split(v[o[i]], a, ",")
+					for (j=2; j<=c; j++) { t=a[j]; k=j-1; while (k>0 && a[k]+0 > t+0) { a[k+1]=a[k]; k-- } a[k+1]=t }
+					s=""; for (j=1; j<=c; j++) s=(s == "" ? a[j] : s "," a[j])
+					print o[i] "|" s
+				}
+			}' "$tmpdir/fdb")
+			[ -z "$macs" ] && continue
+			get_eth_stats "$port" || continue
+			# Access port VLAN from UCI (no ip-bridge needed); a per-MAC VID from bridge fdb takes precedence
+			port_vid=""
+			[ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_vid=$(port_access_vlan "$bridge" "$port")
+			eth_sta=1 # flag that we have some stations
+			echo "      \"$port@$bridge\": {" > "$tmpdir/apmond_block"
+
+			for mac in $macs; do
+				vids=${mac#*|}
+				[ -z "$vids" ] && vids="$port_vid"
+				mac=${mac%%|*}
+				timestamp=$(date +%s)000
+				date_time="$(date -d "@${timestamp:0:10}")"
+				date_time=$(echo ${date_time// /_})
+				echo "        \"$mac\": {" >> "$tmpdir/apmond_block"
+				echo "          \"rx_bytes\": \"$rx_bytes\"," >> "$tmpdir/apmond_block"
+				echo "          \"tx_bytes\": \"$tx_bytes\"," >> "$tmpdir/apmond_block"
+				echo "          \"rx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
+				echo "          \"tx_bitrate\": \"$speed\"," >> "$tmpdir/apmond_block"
+				echo "          \"stats_scope\": \"port\"," >> "$tmpdir/apmond_block"
+				[ -n "$vids" ] && echo "          \"vlan\": \"$vids\"," >> "$tmpdir/apmond_block"
+				echo "          \"timestamp\": \"$timestamp\"," >> "$tmpdir/apmond_block"
+				echo "          \"date_time\": \"$date_time\"" >> "$tmpdir/apmond_block"
+				echo "        }," >> "$tmpdir/apmond_block"
+			done
+
+			sed -i '$ s/,$//' "$tmpdir/apmond_block"
+			echo "      }" >> "$tmpdir/apmond_block"
+			append_block
+		done
+	done
+
+	rm -f "$tmpdir/fdb"
+}
+
+# swconfig_vlan_speed <vlan id>: speed of the untagged (physical) ports of a swconfig VLAN.
+# One port: its speed or "down". Several ports (no MAC->port map without an ARL table): speeds of up ports joined with "/", or "down".
+swconfig_vlan_speed() {
+	local vid="$1" sw ports p link spd out="" n=0
+
+	command -v swconfig >/dev/null 2>&1 || return 1
+	sw=$(swconfig list 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="Found:") {print $(i+1); exit}}')
+	[ -z "$sw" ] && sw="switch0"
+	ports=$(swconfig dev "$sw" vlan "$vid" get ports 2>/dev/null) || return 1
+
+	for p in $ports; do
+		case "$p" in
+			*t|*[!0-9]*) continue ;;
+		esac
+		n=$((n+1))
+		link=$(swconfig dev "$sw" port "$p" get link 2>/dev/null)
+		case "$link" in
+			*link:up*)
+				spd=$(echo "$link" | sed -n 's/.*speed:\([0-9][0-9]*\).*/\1/p')
+				[ -z "$spd" ] && spd="unknown"
+				out="${out:+$out/}$spd"
+			;;
+		esac
+	done
+
+	[ "$n" -eq 0 ] && return 1
+	[ -z "$out" ] && out="down"
+	echo "$out"
+}
+
+# get_link_speed <iface>: Mb/s, "down" only when the link really is down, "unknown" when it cannot be found
+get_link_speed() {
+	local iface="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" speed oper vid
+
+	speed=$(cat "$sysnet/$iface/speed" 2>/dev/null)
+	if [ -n "$speed" ] && [ "$speed" != "-1" ]; then
+		echo "$speed"
+		return 0
+	fi
+
+	oper=$(cat "$sysnet/$iface/operstate" 2>/dev/null)
+
+	vid=""
+	if [ -r "/proc/net/vlan/$iface" ]; then
+		vid=$(awk '/VID:/ {for(i=1;i<=NF;i++) if ($i=="VID:") {print $(i+1); exit}}' "/proc/net/vlan/$iface" 2>/dev/null)
+	fi
+	if [ -z "$vid" ]; then
+		case "$iface" in
+			*.*) vid="${iface##*.}" ;;
+		esac
+	fi
+	case "$vid" in
+		""|*[!0-9]*) vid="" ;;
+	esac
+
+	if [ -n "$vid" ]; then
+		speed=$(swconfig_vlan_speed "$vid") && [ -n "$speed" ] && { echo "$speed"; return 0; }
+	fi
+
+	[ "$oper" = "down" ] && { echo "down"; return 0; }
+	echo "unknown"
+}
+
+get_eth_stats() {
+	local iface="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+
+	[ -z "$iface" ] && return 1
+	[ ! -d "$sysnet/$iface" ] && return 1
+
+	# Link rate (Mb/s): sysfs, else swconfig for VLAN interfaces, else "unknown"
+	speed=$(get_link_speed "$iface")
+
+	# RX / TX bytes from sysfs
+	rx_bytes=$(cat "$sysnet/$iface/statistics/rx_bytes" 2>/dev/null)
+	tx_bytes=$(cat "$sysnet/$iface/statistics/tx_bytes" 2>/dev/null)
+
+	# Fallback to ip -s if sysfs counters are missing
+	if [ -z "$rx_bytes" ] || [ -z "$tx_bytes" ]; then
+		local stats
+		stats=$(ip -s -o link show dev "$iface" 2>/dev/null)
+		rx_bytes=$(echo "$stats" | awk '{print $4}')
+		tx_bytes=$(echo "$stats" | awk '{print $6}')
+	fi
+	return 0
+}
+
+get_system_stats_json() {
+	uptime_sec=$(cut -d' ' -f1 < /proc/uptime | cut -d. -f1)
+
+	load1=$(cut -d' ' -f1 < /proc/loadavg)
+	load5=$(cut -d' ' -f2 < /proc/loadavg)
+	load15=$(cut -d' ' -f3 < /proc/loadavg)
+
+	if grep -q MemAvailable /proc/meminfo; then
+		free_ram=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+	else
+		free_ram=$(awk '/MemFree/ {print $2}' /proc/meminfo)
+	fi
+
+	# apmond: skip the df header line if /overlay does not exist
+	free_flash=$(df /overlay 2>/dev/null | awk 'NR > 1 {v = $(NF-2)} END {print v}')
+	is_uint "$free_flash" || free_flash=$(df / 2>/dev/null | awk 'NR > 1 {v = $(NF-2)} END {print v}')
+	is_uint "$free_flash" || free_flash=0
+
+	# CPU temperature
+	cpu_temp="not available"
+	for zone in /sys/class/thermal/thermal_zone*; do
+		[ -e "$zone" ] || continue
+		type=$(cat "$zone/type" 2>/dev/null)
+		case "$type" in
+			*cpu*|*CPU*|*core*|*thermal*)
+				temp_raw=$(cat "$zone/temp" 2>/dev/null)
+				if [ -n "$temp_raw" ] && [ "$temp_raw" -eq "$temp_raw" ] 2>/dev/null; then
+					cpu_temp=$(awk "BEGIN {printf \"%.1f\", $temp_raw / 1000}")
+					break
+				fi
+				;;
+		esac
+	done
+
+	# CPU frequency
+	cpu_freq="none scaling"
+	if [ -e /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+		freq_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
+		if [ -n "$freq_khz" ] && [ "$freq_khz" -eq "$freq_khz" ] 2>/dev/null; then
+			cpu_freq=$(awk "BEGIN {printf \"%d\", $freq_khz / 1000}")
+		fi
+	fi
+
+	get_cached_factory_mac
+
+	echo "    \"node_status\": {"
+	echo "      \"apmond_version\": \"$version\","
+	echo "      \"apmond_protocol\": \"$protocol_version\","
+	echo "      \"apmond_checksum\": \"$checksum\","
+	echo "      \"factory_mac\": \"$factory_mac\","
+	echo "      \"device_mac\": \"$device_mac\","
+	echo "      \"uptime_seconds\": ${uptime_sec:-0},"
+	echo "      \"load_average_1min\": \"$load1\","
+	echo "      \"load_average_5min\": \"$load5\","
+	echo "      \"load_average_15min\": \"$load15\","
+	echo "      \"free_ram_kb\": ${free_ram:-0},"
+	echo "      \"free_flash_kb\": ${free_flash:-0},"
+	echo "      \"cpu_temperature_c\": \"$cpu_temp\","
+	echo "      \"cpu_frequency_mhz\": \"$cpu_freq\""
+	echo "    },"
+}
+
+usi_full() {
+	if [ ! -s "$tmpdir/wifidetect" ]; then
+		outputfile="$tmpdir/wifidetect"
+		wifi_chipset_detect
+	fi
+
+	# wifidetect ends with the phy object close ("    }" or "    \"phy\": {}") then "  }" and "}":
+	# drop the last two lines and continue the System object after the phy object
+	detect=$(sed '$d' "$tmpdir/wifidetect" | sed '$d')
+	echo "$detect,"
+	get_system_stats_json
+}
+
+#############################################
+# Transport - client role
+#############################################
+server_url() {
+	# The collector is always the router at <ula_base>:<ula_subnet>::1, as the mesh11sd portal
+	echo "${APMOND_TEST_SCHEME:-https}://[$router_ula]:$port$cgi_path"
+}
+
+send_request() {
+	# $1 user agent, $2 query string (hex chunk, may be empty)
+	local url="$apmon_url"
+	local nocert="--no-check-certificate"
+
+	[ -n "$2" ] && url="$url?$2"
+	[ -n "$APMOND_TEST_SCHEME" ] && nocert=""
+
+	wget -q -T "$timeout" -O - -U "$1" $nocert "$url" 2>/dev/null
+}
+
+send_ap_data() {
+
+	if [ "$enabled" != "1" ]; then
+		log_debug "apmond - disabled"
+		return 1
+	fi
+
+
+	get_device_mac
+	ap_macaddr="$device_mac"
+
+	if [ -z "$ap_macaddr" ] || [ "$ap_macaddr" = "unknown" ]; then
+		log_error "apmond - unable to determine a device mac address"
+		return 1
+	fi
+
+	maxchunksize=2048
+	strindex=0
+	chunkstatus=""
+	hostname=$(uci -q get system.@system[0].hostname 2> /dev/null | awk '{printf "%s", $1}')
+	[ -z "$hostname" ] && hostname=$(cat /proc/sys/kernel/hostname 2>/dev/null)
+	# The user agent is ";" separated and stored space separated - keep the hostname safe
+	hostname=$(echo "$hostname" | tr -cd 'A-Za-z0-9._-')
+	[ -z "$hostname" ] && hostname="unknown"
+
+	str_data=$(get_ap_data)
+	: > "$tmpdir/hexencoded"
+	[ -n "$str_data" ] && str_to_hex "$str_data"
+	hexencoded=$(cat "$tmpdir/hexencoded")
+	hexencoded_len=$((${#hexencoded}))
+
+	# Authentication: signature = sha256(secret|mac|timestamp|sha256(payload))
+	ts=$(date +%s)
+	payload_hash=$(sha256_str "$hexencoded")
+	signature=$(make_signature "$apmon_secret" "$ap_macaddr" "$ts" "$payload_hash")
+	apmon_url=$(server_url)
+
+	# If no data, send a spider (keeps the protocol the same as mesh11sd)
+	if [ "$hexencoded_len" -eq 0 ]; then
+		spider="-s"
+	else
+		spider=""
+	fi
+
+	log_debug "apmond connecting to server [ $apmon_url ]"
+
+	while true; do
+		# get a chunk
+		chunk=${hexencoded:$strindex:$maxchunksize}
+		chunksize=$((${#chunk}))
+
+		if [ -z "$chunk" ]; then
+
+			if [ "$spider" = "-s" ]; then
+				chunkstatus="spider"
+			else
+				chunkstatus="end"
+			fi
+
+			user_agent="apmond;$hostname;$ap_macaddr;$chunkstatus;$strindex;$ts;$payload_hash;$signature"
+			send_reply=$(send_request "$user_agent" "")
+			retcode=$?
+			send_status=$(echo "$send_reply" | awk 'NF {printf "%s", $1; exit}')
+			log_debug "apmond - send_ap_data - chunkstatus [ $chunkstatus ], return code [ $retcode ], send_status [ $send_status ]"
+			break
+
+		elif [ "$strindex" -eq 0 ]; then
+			chunkstatus="begin"
+		else
+			chunkstatus="chunk"
+		fi
+
+		user_agent="apmond;$hostname;$ap_macaddr;$chunkstatus;$strindex;$ts;$payload_hash;$signature"
+		send_reply=$(send_request "$user_agent" "$chunk")
+		retcode=$?
+		send_status=$(echo "$send_reply" | awk 'NF {printf "%s", $1; exit}')
+		log_debug "apmond - send_ap_data - chunkstatus [ $chunkstatus ], chunksize [ $chunksize ], return code [ $retcode ], send_status [ $send_status ], sent [ $strindex ]"
+
+		if [ "$apmon_verbose_debug_enable" -eq 1 ]; then
+			log_debug "apmond - user agent [ $user_agent ]"
+		fi
+
+		if [ "$send_status" = "nack" ] || [ "$retcode" -ne 0 ]; then
+			break
+		fi
+
+		# Increment the pointer
+		strindex=$((strindex+maxchunksize))
+	done
+
+	# The collector address is derived from apmon_seed, so a node with a different passphrase
+	# targets an address nobody holds (wget fails, usually return code 4). If the collector is
+	# reached but rejects the signature, the passphrases differ too. Both get the same hint.
+	seed_hint="check that apmon_seed is the same on every node"
+
+	if [ "$send_status" = "nack" ]; then
+		case "$send_reply" in
+			*"signature"*)
+				log_error "apmond - return code [ $retcode ], send_status [ $send_status ], data rejected by server (bad signature) - $seed_hint"
+			;;
+			*)
+				log_error "apmond - return code [ $retcode ], send_status [ $send_status ], data rejected by server"
+			;;
+		esac
+		retcode=1
+	elif [ "$retcode" -ne 0 ]; then
+		log_warning "apmond - unable to reach server [ $apmon_url ], return code [ $retcode ] - $seed_hint"
+	fi
+
+	echo "last_send=\"$(date)\"; last_status=\"${send_status:-none}\"; last_retcode=\"$retcode\"; last_bytes=\"$hexencoded_len\"" > "$tmpdir/last_send"
+	return "$retcode"
+}
+
+#############################################
+# Receiver - every node runs it, only the router is sent to (called from apmon.cgi, which the daemon writes to cgi_dir)
+#############################################
+nack() {
+	log_warning "apmond - $1 - rejecting attempted apmond server access"
+	echo -n "nack ERROR 418: Invalid HTCPCP, [ $1 ]"
+	return 1
+}
+
+# check_node_protocol: collector side, $1 node id (mac12), $2 hex report file.
+# Reads the reporting node's node_status.apmond_protocol straight from the hex (no full decode: hex_to_str
+# takes minutes on big reports) and compares it with our protocol_version. A mismatch never rejects the
+# report (mixed versions are normal while island meshes / cabled AP groups are upgraded), it is logged
+# once per node per protocol value (state in the volatile run dir) and a notice is logged when back in line.
+check_node_protocol() {
+	local node="$1" file="$2" proto state="$tmpdir/protocol_mismatch/$1"
+
+	# hex of: "apmond_protocol": "
+	proto=$(awk 'BEGIN { for (i = 32; i < 127; i++) h[sprintf("%02x", i)] = sprintf("%c", i) }
+		{ p = index($0, "2261706d6f6e645f70726f746f636f6c223a2022"); if (!p) exit
+		  s = substr($0, p + 40, 64); v = ""
+		  for (i = 1; i < length(s); i += 2) { c = substr(s, i, 2); if (c == "22") break; v = v h[c] }
+		  print v; exit }' "$file" 2>/dev/null | tr -cd '0-9A-Za-z._-')
+	if [ -z "$proto" ]; then
+		# mesh11sd-format report (node_status.mesh11sd_version, no apmond_protocol): mesh11sd sends the
+		# protocol 1 format, so it is compatible - note it once at debug level, no warning
+		if grep -q "226d657368313173645f76657273696f6e223a2022" "$file" 2>/dev/null; then
+			proto="$protocol_version"
+			mkdir -p "$tmpdir/protocol_mesh11sd"
+			if [ ! -f "$tmpdir/protocol_mesh11sd/$node" ]; then
+				: > "$tmpdir/protocol_mesh11sd/$node"
+				log_debug "apmond - node [ $node ] is a mesh11sd node (no apmond_protocol), treated as protocol [ $protocol_version ]"
+			fi
+		else
+			proto="0"
+		fi
+	fi
+	mkdir -p "$tmpdir/protocol_mismatch"
+
+	if [ "$proto" = "$protocol_version" ]; then
+		if [ -f "$state" ]; then
+			rm -f "$state"
+			log_notice "apmond - node [ $node ] protocol [ $proto ] now matches collector protocol [ $protocol_version ]"
+		fi
+		return 0
+	fi
+
+	[ -f "$state" ] && [ "$(cat "$state")" = "$proto" ] && return 0
+	echo "$proto" > "$state"
+
+	if [ "$proto" = "0" ]; then
+		log_error "apmond - WARNING node [ $node ] sent no apmond_protocol (protocol 0/unknown), collector protocol [ $protocol_version ] - upgrade apmond on all nodes"
+	else
+		log_error "apmond - WARNING node [ $node ] protocol [ $proto ] differs from collector protocol [ $protocol_version ] - upgrade apmond on all nodes"
+	fi
+	return 0
+}
+
+write_node_data() {
+	node_id="$1"
+	data_raw="$2"
+
+	if [ "$enabled" != "1" ]; then
+		nack "apmond disabled"
+		return 1
+	fi
+
+
+	if [ -z "$node_id" ]; then
+		nack "Empty node_id"
+		return 1
+	fi
+
+	if [ "$apmon_verbose_debug_enable" -eq 1 ]; then
+		log_debug "apmond - Node id string: [ $node_id ]"
+	fi
+
+	# Parse the v1 user agent: apmond;hostname;mac;status;offset;timestamp;payloadhash;signature
+	oldifs="$IFS"
+	IFS=";"
+	set -- $node_id
+	IFS="$oldifs"
+	node_type="$1"; node_hostname="$2"; node_mac_raw="$3"; chunkstatus="$4"; strindex="$5"
+	node_ts="$6"; node_hash="$7"; node_sig="$8"
+
+	if [ "$node_type" != "apmond" ]; then
+		nack "Invalid node type"
+		return 1
+	fi
+
+	case "$node_hostname" in
+		""|*[!A-Za-z0-9._-]*) nack "Bad node hostname"; return 1;;
+	esac
+
+	node_mac=$(echo "$node_mac_raw" | awk -F ":" 'NF==6 {printf "%s%s%s%s%s%s", $1, $2, $3, $4, $5, $6}')
+
+	if ! is_hex "$node_mac" || [ "${#node_mac}" -ne 12 ]; then
+		nack "Invalid node mac"
+		return 1
+	fi
+
+	node_mac=$(echo "$node_mac" | tr 'A-F' 'a-f')
+
+	case "$chunkstatus" in
+		begin|chunk|end|spider) ;;
+		*) nack "Invalid chunk status"; return 1;;
+	esac
+
+	if ! is_uint "$strindex" || ! is_uint "$node_ts"; then
+		nack "Invalid parameters"
+		return 1
+	fi
+
+	if ! is_hex "$node_hash" || [ "${#node_hash}" -ne 64 ] || ! is_hex "$node_sig" || [ "${#node_sig}" -ne 64 ]; then
+		nack "Missing or invalid signature"
+		return 1
+	fi
+
+	# Verify the signature (checked on every request, so a bad secret is rejected before any data is buffered)
+	expected_sig=$(make_signature "$apmon_secret" "$node_mac_raw" "$node_ts" "$node_hash")
+
+	if [ "$expected_sig" != "$node_sig" ]; then
+		nack "Bad signature from [ $node_hostname ] id [ $node_mac ]"
+		return 1
+	fi
+
+	# Reject stale or future timestamps
+	now=$(date +%s)
+	age=$((now - node_ts))
+	[ "$age" -lt 0 ] && age=$((0 - age))
+
+	if [ "$age" -gt "$max_age" ]; then
+		nack "Stale timestamp from [ $node_hostname ] id [ $node_mac ], age [ $age ]s"
+		return 1
+	fi
+
+	# Reject replays: the timestamp must be newer than the last accepted report from this AP
+	last_ts=0
+	[ -f "$tmpdir/last_ts/$node_mac" ] && last_ts=$(cat "$tmpdir/last_ts/$node_mac")
+	is_uint "$last_ts" || last_ts=0
+
+	if [ "$node_ts" -le "$last_ts" ]; then
+		nack "Replayed report from [ $node_hostname ] id [ $node_mac ]"
+		return 1
+	fi
+
+	if [ -n "$data_raw" ] && ! is_hex "$data_raw"; then
+		nack "Invalid data"
+		return 127
+	fi
+
+	if [ "${#data_raw}" -gt 4096 ]; then
+		nack "Chunk too large"
+		return 1
+	fi
+
+	staging="$tmpdir/staging/$node_mac"
+	session="$node_ts;$node_hash"
+
+	case "$chunkstatus" in
+		begin)
+			if [ "$strindex" -ne 0 ]; then
+				nack "begin with non zero offset"
+				return 1
+			fi
+
+			echo -n "$session" > "$staging.session"
+			echo -n "$node_id" > "$staging.ua"
+			echo -n "$data_raw" > "$staging.data"
+			echo -n "*begin"
+		;;
+
+		chunk|end)
+			if [ ! -f "$staging.session" ] || [ "$(cat "$staging.session")" != "$session" ]; then
+				nack "No matching begin for this report"
+				return 1
+			fi
+
+			received=$(wc -c < "$staging.data")
+
+			# Every chunk except the last is full size, so a chunk offset must equal the data received so far.
+			# (The end request offset is not checked; the payload hash covers the whole report.)
+			if [ "$chunkstatus" = "chunk" ] && [ "$received" -ne "$strindex" ]; then
+				nack "Offset mismatch, expected [ $received ] got [ $strindex ]"
+				rm -f "$staging.session" "$staging.ua" "$staging.data"
+				return 1
+			fi
+
+			if [ "$chunkstatus" = "chunk" ]; then
+
+				if [ $((received + ${#data_raw})) -gt "$max_report_size" ]; then
+					nack "Report too large"
+					rm -f "$staging.session" "$staging.ua" "$staging.data"
+					return 1
+				fi
+
+				echo -n "$data_raw" >> "$staging.data"
+				echo -n "*chunk"
+			else
+				# end: verify the payload hash, only then store
+				data_hash=$(sha256sum "$staging.data" | awk '{printf "%s", $1}')
+
+				if [ "$data_hash" != "$node_hash" ]; then
+					nack "Payload hash mismatch from [ $node_hostname ] id [ $node_mac ]"
+					rm -f "$staging.session" "$staging.ua" "$staging.data"
+					return 1
+				fi
+
+				# Same storage format as mesh11sd: "<begin user agent> <hexdata> <end user agent>"
+				{
+					cat "$staging.ua"
+					echo -n " "
+					cat "$staging.data"
+					echo " $node_id"
+				} > "$datadir/apmond_data/.$node_mac.tmp" && mv "$datadir/apmond_data/.$node_mac.tmp" "$datadir/apmond_data/$node_mac"
+
+				echo -n "$node_ts" > "$tmpdir/last_ts/$node_mac"
+				check_node_protocol "$node_mac" "$staging.data"
+				rm -f "$staging.session" "$staging.ua" "$staging.data"
+				log_info "apmond data received from node [$node_hostname] id [ $node_mac ]"
+				echo -n "*end"
+			fi
+		;;
+
+		spider)
+			# Authenticated keepalive with no client data - nothing to store
+			echo -n "$node_ts" > "$tmpdir/last_ts/$node_mac"
+			echo -n "*spider"
+		;;
+	esac
+
+	return 0
+}
+
+#############################################
+# CLI
+#############################################
+show_help() {
+	echo "
+  Usage: apmond [option] [argument...]
+
+  option: help, -h, --help
+	Show this help
+
+  option: version
+	Print the version of apmond
+
+  option: status
+	Show the apmond configuration and runtime state
+
+  option: show_ap_data [ap_mac_id | all]
+	Show the usage data received from access points (on the router / collector)
+	With no argument, list the access points that have sent data
+
+  option: read_log [ -f ]
+	Displays the apmond log
+	If -f is specified, the existing log will be deleted and all subsequent logs will be followed on the display
+
+  option: debuglevel [0 | 1 | 2 | 3]
+	With no argument, print the current debuglevel
+	With an argument, set the debuglevel (0 = silent, 1 = notice (default), 2 = info, 3 = debug)
+	The change is committed immediately and applied by the running daemon on its next loop pass (no restart)
+
+  option: get_ap_data
+	Usage: apmond get_ap_data
+	Get json format access point data for this node (as mesh11sd get_ap_data; nothing is sent)
+
+  option: send
+	Collect and send access point data to the collector ([<ula>::1]) once
+
+  option: detect
+	Run router detection once and apply the runtime ULA addresses
+
+  option: cleanup
+	Remove the runtime ULA addresses added by apmond
+
+  option: daemon
+	Run the daemon (normally started by procd)
+
+  option: write_node_data [user_agent] [query_string]
+	Used internally by apmon.cgi (written by the daemon to cgi_dir, default /www/cgi-bin)
+"
+}
+
+show_ap_data() {
+	data_nodes=$(ls "$datadir/apmond_data/" 2>/dev/null | awk '{printf "%s ", $1}')
+
+	if [ "$1" = "all" ]; then
+
+		if [ -z "$data_nodes" ]; then
+			exit 0
+		fi
+
+		all_first=1
+
+		for data_node in $data_nodes; do
+			hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$data_node" 2>/dev/null)"
+
+			if [ ! -z "$str" ]; then
+				str=$(echo -n "$str" | tail -n +2 | head -n -2)
+
+				if [ "$all_first" -eq 1 ]; then
+					echo "{"
+					echo -n "$str"
+					all_first=0
+				else
+					echo -e -n "\n  },\n$str"
+				fi
+			fi
+		done
+
+		echo -e "\n  }\n}"
+
+	elif [ -z "$1" ]; then
+		echo "===================================================================================================================="
+		echo " Show access point usage data"
+		echo "    Usage: apmond show_ap_data [ap_mac_id]"
+		echo "       or: apmond show_ap_data all"
+		echo
+		echo " If the access point you are looking for is not in the list - it probably has not had any connections yet - try again later."
+		echo "===================================================================================================================="
+
+		if [ ! -z "$data_nodes" ]; then
+			echo " The following access points have sent usage data:"
+
+			for data_node in $data_nodes; do
+				echo "===================================================================================================================="
+				echo
+				echo "Access point ID (ap_mac_id)	$data_node"
+			done
+
+			echo "===================================================================================================================="
+		fi
+
+		exit 1
+
+	else
+		node=$(echo "$1" | tr -d ':' | tr 'A-F' 'a-f')
+
+		if ! is_hex "$node" || [ "${#node}" -ne 12 ]; then
+			echo "Invalid ap_mac_id [ $1 ]"
+			exit 1
+		fi
+
+		hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$node" 2>/dev/null)"
+
+		if [ ! -z "$str" ]; then
+			echo "$str"
+		fi
+	fi
+
+	exit 0
+}
+
+# json_str <string>: JSON string body (escapes \ and ", strips control characters)
+json_str() {
+	printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+# json_array <indent> <items...>: prints a JSON array body the way jq . does: "[]" if empty, otherwise
+# "[", one element per line indented <indent>+2 spaces, and "]" at <indent> (caller prints key and trailing comma)
+json_array() {
+	local ind="$1" sep="" it
+	shift
+	if [ "$#" -eq 0 ]; then
+		printf '[]'
+		return 0
+	fi
+	printf '['
+	for it in "$@"; do
+		printf '%s\n%s  "%s"' "$sep" "$ind" "$(json_str "$it")"
+		sep=","
+	done
+	printf '\n%s]' "$ind"
+}
+
+# daemon_pid: pid of a running "apmond daemon" (BusyBox: scan /proc)
+daemon_pid() {
+	local d cmd
+	for d in /proc/[0-9]*; do
+		[ "${d#/proc/}" = "$$" ] && continue
+		# the pid may exit between the glob and the read: the group redirect also silences ash's "can't open"
+		cmd=$({ tr '\000' ' ' < "$d/cmdline"; } 2>/dev/null)
+		case "$cmd" in
+			*apmond\ daemon*) echo "${d#/proc/}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# show_status: JSON, same style as node_status in show_ap_data. Never shows the passphrase or the secret (nor apmon_id, derived from it).
+show_status() {
+	local seed_default="no" b sep pid running="no" running_checksum ifaces="" i addrs a first aps
+
+	[ "$default_seed_in_use" -eq 1 ] && seed_default="yes"
+	pid=$(daemon_pid) && running="yes"
+	aps=$(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)
+
+	echo "{"
+	echo "  \"apmond_status\": {"
+	echo "    \"apmond_version\": \"$(json_str "$version")\","
+	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
+	# checksum: the running daemon's own hash (written at daemon start); the script's hash when no daemon runs.
+	# installed_checksum: sha256 of /usr/sbin/apmond as installed on disk now. They differ after an upgrade without a restart.
+	running_checksum="$checksum"
+	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && { read -r running_checksum < "$tmpdir/daemon_checksum"; } 2>/dev/null
+	echo "    \"checksum\": \"$(json_str "$running_checksum")\","
+	echo "    \"installed_checksum\": \"$checksum\","
+	[ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ] && echo "    \"checksum_warning\": \"running daemon differs from /usr/sbin/apmond - restart apmond\","
+	echo "    \"enabled\": \"$(json_str "$enabled")\","
+	echo "    \"daemon_running\": \"$running\","
+	echo "    \"daemon_pid\": \"${pid:-none}\","
+	echo "    \"interval_seconds\": \"$(json_str "$interval")\","
+	echo "    \"debuglevel\": \"$(json_str "$debuglevel")\","
+	echo "    \"router_detect\": \"$(json_str "$router_detect")\","
+	echo "    \"default_passphrase\": \"$seed_default\","
+	[ "$seed_default" = "yes" ] && echo "    \"passphrase_warning\": \"The built-in default passphrase is in use. Make ApmonD more secure by setting option apmon_seed in /etc/config/apmond (the same on every node)\","
+
+	if [ -n "$apmon_seed" ]; then
+		get_device_mac
+		[ -f "$tmpdir/is_router" ] && . "$tmpdir/is_router"
+		load_role
+		echo "    \"ula_prefix\": \"$(json_str "$ula_prefix")\","
+		echo "    \"ula_subnet\": \"$(json_str "$ula_subnet")\","
+		echo "    \"collector\": \"$(json_str "$router_ula")\","
+		echo "    \"device\": \"$(json_str "$id_device")\","
+		echo "    \"ap_mac_id\": \"$(json_str "$device_mac")\","
+		detect_bridges
+		echo "    \"bridge_detect\": \"$([ "$bridge_auto" -eq 1 ] && echo auto || echo list)\","
+		printf '    "bridges": '
+		json_array "    " $bridges
+		echo ","
+		echo "    \"role\": \"$(json_str "${role:-unknown (daemon not run yet)}")\","
+		echo "    \"role_reason\": \"$(json_str "${role_reason:-none}")\","
+		echo "    \"node_ula\": \"$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")\","
+
+		for i in $id_device $bridge_list; do
+			case " $ifaces " in *" $i "*) ;; *) ifaces="$ifaces $i" ;; esac
+		done
+		echo "    \"ula_addresses\": {"
+		first=1
+		# kernel shows addresses in canonical form (no leading zeros in a group): compare canonical prefixes
+		ula_base_c=$(echo "$ula_base" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g')
+		for i in $ifaces; do
+			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base_c:" '$1=="inet6" && index($2,p)==1 {print $2}')
+			[ "$first" -eq 1 ] || echo ","
+			first=0
+			printf '      "%s": ' "$(json_str "$i")"
+			json_array "      " $addrs
+		done
+		echo
+		echo "    },"
+	fi
+
+	if [ -f "$tmpdir/last_send" ]; then
+		. "$tmpdir/last_send"
+		echo "    \"last_send\": {"
+		echo "      \"date_time\": \"$(json_str "$last_send")\","
+		echo "      \"status\": \"$(json_str "$last_status")\","
+		echo "      \"retcode\": \"$(json_str "$last_retcode")\","
+		echo "      \"bytes\": \"$(json_str "$last_bytes")\""
+		echo "    },"
+	fi
+
+	echo "    \"log_mountpoint\": \"$(json_str "$log_mountpoint")\","
+	echo "    \"ap_data_dir\": \"$(json_str "$datadir/apmond_data")\","
+	[ -n "$datadir_reason" ] && echo "    \"storage_warning\": \"$(json_str "$datadir_reason")\","
+	echo "    \"log_file\": \"$(json_str "$logfile")\","
+	echo "    \"cgi_dir\": \"$(json_str "$cgi_dir")\","
+	if [ -n "$log_disabled_reason" ]; then
+		echo "    \"logging\": \"DISABLED: $(json_str "$log_disabled_reason")\","
+	else
+		echo "    \"logging\": \"enabled\","
+	fi
+	echo "    \"runtime_dir\": \"$(json_str "$tmpdir")\","
+	echo "    \"access_points_with_data\": \"$aps\","
+	printf '    "protocol_mismatch_nodes": '
+	json_array "    " $(ls "$tmpdir/protocol_mismatch/" 2>/dev/null)
+	echo
+	echo "  }"
+	echo "}"
+}
+
+warn_default_seed() {
+	[ "$default_seed_in_use" -eq 1 ] || return 0
+	# Logged at notice level (shown at the default debuglevel 1 and above)
+	for msg in \
+		"apmond is using the built-in default passphrase (apmon_seed). Set your own passphrase to make it more secure." \
+		"To set it, on every node: uci set apmond.setup.apmon_seed='<your passphrase>'; uci commit apmond; service apmond restart (or edit option apmon_seed in /etc/config/apmond)"; do
+		log_notice "$msg"
+	done
+}
+
+# set_debuglevel: CLI "debuglevel [N]". Unlike mesh11sd the change is committed at once (LuCI compatibility:
+# no pending uci change left to be committed later by an unrelated LuCI save)
+set_debuglevel() {
+	if [ -z "$1" ]; then
+		echo "$debuglevel"
+		return 0
+	fi
+
+	case "$1" in
+		0|1|2|3)
+			uci set apmond.setup.debuglevel="$1" && uci commit apmond || return 1
+			echo "$1"
+			;;
+		*)
+			echo "Invalid debuglevel requested"
+			return 1
+			;;
+	esac
+}
+
+# reload_debuglevel: re-read debuglevel from uci at the top of each daemon loop pass, apply it if valid
+reload_debuglevel() {
+	local new
+	new=$(uci -q get apmond.setup.debuglevel 2>/dev/null)
+
+	case "$new" in
+		0|1|2|3)
+			if [ "$new" != "$debuglevel" ]; then
+				debuglevel="$new"
+				log_notice "apmond - debuglevel changed to [ $debuglevel ]"
+			fi
+			;;
+	esac
+}
+
+daemon_loop_once() {
+	get_router_state
+	manage_ula
+	send_ap_data
+}
+
+run_daemon() {
+	if [ "$enabled" != "1" ]; then
+		log_notice "apmond - disabled (apmond.setup.enabled=0), idle"
+		while true; do sleep 3600 & wait $!; done
+	fi
+
+
+	warn_default_seed
+	log_datadir
+	setup_apmon_cgi
+	last_seed_warning=$(date +%s)
+	log_notice "apmond $version daemon starting, collector [ $router_ula ], interval [ $interval ]s"
+	echo "$checksum" > "$tmpdir/daemon_checksum"
+	trap 'cleanup_ula; rm -f "$entrynum_file" "$tmpdir/daemon_checksum"; exit 0' INT TERM
+	rm -f "$tmpdir/wifidetect" "$tmpdir/factory_mac" "$tmpdir/apmond/clients.loc" "$tmpdir/role"
+	outputfile="$tmpdir/wifidetect"
+	wifi_chipset_detect
+	get_router_state
+	manage_ula
+	sleep "$startup_delay" & wait $!
+
+	while true; do
+		reload_debuglevel
+
+		if [ "$default_seed_in_use" -eq 1 ] && [ $(( $(date +%s) - last_seed_warning )) -ge "$default_seed_warn_interval" ]; then
+			warn_default_seed
+			last_seed_warning=$(date +%s)
+		fi
+
+		daemon_loop_once
+		sleep "$interval" & wait $!
+	done
+}
+
+##############
+# Start point
+##############
+load_config
+
+# Log entry counter: shared through a file so log calls in $(...) subshells keep it in step.
+# The daemon uses $tmpdir/entrynum (reset at start, removed on stop / cleanup); every other invocation
+# (CLI, apmon.cgi) has its own per-process file, starting at [1] as before and removed on exit.
+if [ "$1" != "daemon" ]; then
+	entrynum_file="$tmpdir/entrynum.$$"
+	trap 'rm -f "$entrynum_file"' EXIT
+fi
+
+case "$1" in
+	""|-h|--help|help) show_help;;
+	version) echo "apmond version $version";;
+	status) show_status;;
+	debuglevel) set_debuglevel "$2"; exit $?;;
+	show_ap_data) show_ap_data "$2";;
+	get_ap_data) get_ap_data; exit 0;;
+	send) send_ap_data; exit $?;;
+	read_log) read_log "$2";;
+	detect) get_router_state; manage_ula; echo "$role";;
+	cleanup) cleanup_ula; rm -f "$tmpdir/entrynum" "$tmpdir/daemon_checksum";;
+	daemon) entrynum_file="$tmpdir/entrynum"; mkdir -p "$tmpdir"; echo 0 > "$entrynum_file"; run_daemon;;
+	write_node_data) write_node_data "$2" "$3"; exit $?;;
+	*) echo "Unknown option [ $1 ]"; show_help; exit 1;;
+esac

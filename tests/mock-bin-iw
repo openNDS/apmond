@@ -1,0 +1,23 @@
+#!/bin/sh
+# Mock iw: "iw dev" and "iw dev <if> station dump". MOCK_STATIONS stations on phy0-ap0, 1 on phy1-ap0
+if [ "$1" = "dev" ] && [ -z "$2" ]; then
+	printf 'phy#0\n\tInterface phy0-ap0\n\t\tifindex 10\n\t\tssid OpenWrt\n\t\ttype AP\nphy#1\n\tInterface phy1-ap0\n\t\tssid OpenWrt5\n\t\ttype AP\n'
+	exit 0
+fi
+if [ "$1" = "dev" ] && [ "$3" = "station" ]; then
+	case "$2" in
+		phy0-ap0) n=${MOCK_STATIONS:-2};;
+		phy1-ap0) n=1;;
+		*) exit 0;;
+	esac
+	i=1
+	while [ $i -le $n ]; do
+		printf 'Station 02:00:00:00:%02x:%02x (on %s)\n' $((i/256)) $((i%256)) "$2"
+		printf '\tinactive time:\t10 ms\n\trx bytes:\t%d\n\trx packets:\t100\n\ttx bytes:\t%d\n\ttx packets:\t90\n\ttx retries:\t3\n\ttx failed:\t0\n' $((i*1000)) $((i*2000))
+		printf '\tsignal:  \t-50 [-52, -53] dBm\n\tsignal avg:\t-51 [-53, -54] dBm\n\ttx bitrate:\t433.3 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 1\n\trx bitrate:\t390.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 1\n'
+		printf '\tavg ack signal:\t-50 dBm\n\tauthorized:\tyes\n\tconnected time:\t%d seconds\n\tcurrent time:\t%s123 ms\n' $((i*10)) "$(date +%s)"
+		i=$((i+1))
+	done
+	exit 0
+fi
+exit 0
