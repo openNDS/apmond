@@ -1,3 +1,14 @@
+apmond (1.0.1)
+  * Add - -v and --version options print the version, as mesh11sd [bluewavenet]
+  * Add - init script service_data runs apmond -v, as mesh11sd, so service apmond start and restart print the version [bluewavenet]
+  * Add - ipv6_canon() reformatted to be easier to read, no change in behaviour [bluewavenet]
+  * Add - json_array() escapes each item on its own line, easier to read, no change in behaviour [bluewavenet]
+  * Add - readability: one statement per line, multi-line if/for/case, json_field() helper for status JSON, no change in behaviour [bluewavenet]
+  * Fix - last_send status from the collector is sanitised and no longer sourced, so a rogue collector reply cannot run commands [bluewavenet]
+  * Add - node_status in the AP report carries node_ula (the node's apmond ULA) and ipv4_addresses (a.b.c.d/len on option device and the configured bridges), after device_mac; older collectors and mesh11sd store and show the report unchanged [bluewavenet]
+
+ -- Rob White <dot@blue-wave.net>  Tue, 27 Oct 2026 21:14:07 +0000
+
 apmond (1.0.0)
   * Add - apmon.cgi is generated at daemon startup and rewritten only if it differs, as mesh11sd does [bluewavenet]
   * Add - cgi_dir option to allow a web server package other than uhttpd, default /www/cgi-bin [bluewavenet]

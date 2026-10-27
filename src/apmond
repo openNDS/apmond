@@ -17,8 +17,8 @@
 # It never runs uci set/commit or writes any configuration file.
 #
 
-last_version="0.1.0"
-version="1.0.0"
+last_version="1.0.0"
+version="1.0.1"
 protocol_version="1"
 
 # sha256 of the running script, computed once per invocation (as mesh11sd: checksum=$(sha256sum /usr/sbin/mesh11sd ...)).
@@ -56,7 +56,9 @@ write_to_syslog() {
 
 	if [ -n "$entrynum_file" ]; then
 		# daemon: counter shared through the run dir, so log calls in $(...) subshells keep it in step
-		[ -f "$entrynum_file" ] && { read -r entrynum < "$entrynum_file"; } 2>/dev/null
+		if [ -f "$entrynum_file" ]; then
+			{ read -r entrynum < "$entrynum_file"; } 2>/dev/null
+		fi
 		entrynum=$((${entrynum:-0} + 1))
 		echo "$entrynum" > "$entrynum_file"
 	else
@@ -64,14 +66,37 @@ write_to_syslog() {
 	fi
 
 	case $debugtype in
-		"emerg") debugnum=0; log_to_stderr="-s";;
-		"crit") debugnum=0; log_to_stderr="-s";;	# apmond addition
-		"err") debugnum=0; log_to_stderr="-s";;
-		"notice") debugnum=1; log_to_stderr="";;
-		"warn") debugnum=1; log_to_stderr="-s";;
-		"info") debugnum=2; log_to_stderr="";;
-		"debug") debugnum=3; log_to_stderr="";;
-		*) debugnum=1; debugtype="notice"; log_to_stderr="";;
+		# crit is an apmond addition
+		emerg|crit|err)
+			debugnum=0
+			log_to_stderr="-s"
+		;;
+
+		notice)
+			debugnum=1
+			log_to_stderr=""
+		;;
+
+		warn)
+			debugnum=1
+			log_to_stderr="-s"
+		;;
+
+		info)
+			debugnum=2
+			log_to_stderr=""
+		;;
+
+		debug)
+			debugnum=3
+			log_to_stderr=""
+		;;
+
+		*)
+			debugnum=1
+			debugtype="notice"
+			log_to_stderr=""
+		;;
 	esac
 
 	if [ "$debuglevel" -ge "$debugnum" ]; then
@@ -111,7 +136,9 @@ write_log() {
 
 	# Truncate the log file to max_log_entries lines
 	log_entries=0
-	[ -f "$logfile" ] && log_entries=$({ wc -l < "$logfile"; } 2>/dev/null)
+	if [ -f "$logfile" ]; then
+		log_entries=$({ wc -l < "$logfile"; } 2>/dev/null)
+	fi
 	is_uint "$log_entries" || log_entries=0
 
 	if [ "$log_entries" -gt "$max_log_entries" ]; then
@@ -155,12 +182,42 @@ read_log() {
 	exit 0
 }
 
-log_error() { syslogmessage="$1"; debugtype="err"; write_to_syslog; }
-log_warning() { syslogmessage="$1"; debugtype="warn"; write_to_syslog; }
-log_notice() { syslogmessage="$1"; debugtype="notice"; write_to_syslog; }
-log_crit() { syslogmessage="$1"; debugtype="crit"; write_to_syslog; }
-log_info() { syslogmessage="$1"; debugtype="info"; write_to_syslog; }
-log_debug() { syslogmessage="$1"; debugtype="debug"; write_to_syslog; }
+# log_<level> <message>: log the message at that level (see write_to_syslog)
+log_error() {
+	syslogmessage="$1"
+	debugtype="err"
+	write_to_syslog
+}
+
+log_warning() {
+	syslogmessage="$1"
+	debugtype="warn"
+	write_to_syslog
+}
+
+log_notice() {
+	syslogmessage="$1"
+	debugtype="notice"
+	write_to_syslog
+}
+
+log_crit() {
+	syslogmessage="$1"
+	debugtype="crit"
+	write_to_syslog
+}
+
+log_info() {
+	syslogmessage="$1"
+	debugtype="info"
+	write_to_syslog
+}
+
+log_debug() {
+	syslogmessage="$1"
+	debugtype="debug"
+	write_to_syslog
+}
 
 #############################################
 # Configuration - read only
@@ -212,8 +269,14 @@ load_config() {
 	bridge_auto=1
 	if [ -n "$bridge_list" ]; then
 		case " $bridge_list " in
-			*" auto "*) bridge_list=$(echo " $bridge_list " | sed 's/ auto / /g; s/^ *//; s/ *$//') ;;
-			*) bridge_auto=0 ;;
+			*" auto "*)
+				# drop every "auto" entry, then trim the spaces
+				bridge_list=$(echo " $bridge_list " | sed 's/ auto / /g; s/^ *//; s/ *$//')
+			;;
+
+			*)
+				bridge_auto=0
+			;;
 		esac
 	fi
 	bridges="$bridge_list"
@@ -241,8 +304,14 @@ load_config() {
 
 	# cgi_dir (as mesh11sd apmond_cgi_dir): where the daemon writes apmon.cgi, so a web server package
 	# other than uhttpd can be used. Normalised to one trailing slash, as mesh11sd does
-	norm_dir "${APMOND_TEST_CGI_DIR:-/www/cgi-bin}"; default_cgi_dir="$normdir"
-	norm_dir "$(get_option setup cgi_dir "$default_cgi_dir")"; cgi_dir="$normdir"
+	local cgi_dir_option
+
+	norm_dir "${APMOND_TEST_CGI_DIR:-/www/cgi-bin}"
+	default_cgi_dir="$normdir"
+
+	cgi_dir_option=$(get_option setup cgi_dir "$default_cgi_dir")
+	norm_dir "$cgi_dir_option"
+	cgi_dir="$normdir"
 
 	resolve_datadir
 	derive_ids
@@ -349,7 +418,7 @@ file_sha256() {
 # run directory, compare sha256 with the live copy and copy over only if it differs or is missing,
 # so an identical copy is left untouched (same inode and mtime).
 setup_apmon_cgi() {
-	local cgi="${cgi_dir}apmon.cgi" tmpcgi="$tmpdir/apmon.cgi" newhash oldhash def
+	local cgi="${cgi_dir}apmon.cgi" tmpcgi="$tmpdir/apmon.cgi" newhash oldhash def defhash
 
 	if [ ! -d "$cgi_dir" ] && ! mkdir -p "$cgi_dir" 2>/dev/null; then
 		log_error "apmond - cannot create cgi_dir [ $cgi_dir ], apmon.cgi not written"
@@ -391,8 +460,12 @@ setup_apmon_cgi() {
 	# exactly the generated file (never someone else's file, nor one that was edited)
 	def="${default_cgi_dir}apmon.cgi"
 
-	if [ "$def" != "$cgi" ] && [ -f "$def" ] && [ "$(file_sha256 "$def")" = "$newhash" ]; then
-		rm -f "$def" && log_notice "apmond - removed the old receiver CGI [ $def ] (cgi_dir is now [ $cgi_dir ])"
+	if [ "$def" != "$cgi" ] && [ -f "$def" ]; then
+		defhash=$(file_sha256 "$def")
+
+		if [ "$defhash" = "$newhash" ]; then
+			rm -f "$def" && log_notice "apmond - removed the old receiver CGI [ $def ] (cgi_dir is now [ $cgi_dir ])"
+		fi
 	fi
 
 	rm -f "$tmpcgi"
@@ -447,29 +520,112 @@ ipv6_canon() {
 	# Print an IPv6 address (optional /len) in the canonical RFC 5952 form the kernel and ip print:
 	# lower case, no leading zeros in a group, the longest run (2+) of zero groups as "::".
 	# Needed so addresses we generate (e.g. "...:5254:00ff:fe12:3401") match "ip -6 addr show" output.
+	#
+	# Example: "FD12:0034:0000:0000:0000:00ff:fe12:3401/64" -> "fd12:34::ff:fe12:3401/64"
 	echo "$1" | awk '{
-		addr = tolower($0); len = ""
-		if (index(addr, "/")) { len = substr(addr, index(addr, "/")); addr = substr(addr, 1, index(addr, "/") - 1) }
-		# expand to 8 groups
+		# Step 1: lower case everything, then split off any "/len" suffix to put back at the end
+		addr = tolower($0)
+		len = ""
+		slash = index(addr, "/")
+
+		if (slash) {
+			len = substr(addr, slash)
+			addr = substr(addr, 1, slash - 1)
+		}
+
+		# Step 2: split the address into the groups left and right of "::" (if there is one)
 		dc = index(addr, "::")
-		if (dc) { left = substr(addr, 1, dc - 1); right = substr(addr, dc + 2) } else { left = addr; right = "" }
-		nl = (left == "") ? 0 : split(left, L, ":"); nr = (right == "") ? 0 : split(right, R, ":")
-		out = 0
-		for (i = 1; i <= nl; i++) h[++out] = L[i]
-		if (dc) for (i = 0; i < 8 - nl - nr; i++) h[++out] = "0"
-		for (i = 1; i <= nr; i++) h[++out] = R[i]
-		for (i = 1; i <= 8; i++) { x = h[i]; sub(/^0+/, "", x); if (x == "") x = "0"; h[i] = x }
-		bs = 0; bl = 0; cs = 0; cl = 0
-		for (i = 1; i <= 8; i++) {
-			if (h[i] == "0") { if (cl == 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } } else cl = 0
+
+		if (dc) {
+			left = substr(addr, 1, dc - 1)
+			right = substr(addr, dc + 2)
+		} else {
+			left = addr
+			right = ""
 		}
-		r = ""
-		for (i = 1; i <= 8; i++) {
-			if (bl >= 2 && i == bs) { r = r "::"; i = bs + bl - 1; continue }
-			if (r != "" && substr(r, length(r)) != ":") r = r ":"
-			r = r h[i]
+
+		nleft = 0
+		nright = 0
+
+		if (left != "") {
+			nleft = split(left, L, ":")
 		}
-		print r len
+
+		if (right != "") {
+			nright = split(right, R, ":")
+		}
+
+		# Step 3: expand to the full 8 groups: left groups, then "::" filled with "0" groups, then right groups
+		n = 0
+
+		for (i = 1; i <= nleft; i++) {
+			group[++n] = L[i]
+		}
+
+		if (dc) {
+			for (i = 0; i < 8 - nleft - nright; i++) {
+				group[++n] = "0"
+			}
+		}
+
+		for (i = 1; i <= nright; i++) {
+			group[++n] = R[i]
+		}
+
+		# Step 4: strip leading zeros from each group ("00ff" -> "ff", "0000" -> "0")
+		for (i = 1; i <= 8; i++) {
+			g = group[i]
+			sub(/^0+/, "", g)
+
+			if (g == "") {
+				g = "0"
+			}
+
+			group[i] = g
+		}
+
+		# Step 5: find the longest run of "0" groups (the first one wins a tie)
+		best_start = 0
+		best_len = 0
+		run_start = 0
+		run_len = 0
+
+		for (i = 1; i <= 8; i++) {
+			if (group[i] == "0") {
+				if (run_len == 0) {
+					run_start = i
+				}
+
+				run_len++
+
+				if (run_len > best_len) {
+					best_len = run_len
+					best_start = run_start
+				}
+			} else {
+				run_len = 0
+			}
+		}
+
+		# Step 6: join the groups with ":", writing that run as "::" if it is 2 or more groups long
+		result = ""
+
+		for (i = 1; i <= 8; i++) {
+			if (best_len >= 2 && i == best_start) {
+				result = result "::"
+				# skip over the rest of the zero run
+				i = best_start + best_len - 1
+				continue
+			}
+
+			if (result != "" && substr(result, length(result)) != ":") {
+				result = result ":"
+			}
+
+			result = result group[i]
+		}
+
+		print result len
 	}'
 }
 
@@ -484,7 +640,7 @@ eui64_iid() {
 # Router (collector) detection - port of mesh11sd get_portal_state, portal_detect=1
 #############################################
 get_router_state() {
-	local up_zone default_ipv6_gw default_ipv4_gw
+	local up_zone default_ipv6_gw default_ipv4_gw up_count unknown_count
 
 	if [ "$router_detect" -eq 0 ]; then
 		detected_state="router"
@@ -501,7 +657,15 @@ get_router_state() {
 
 		if [ -n "$up_zone" ]; then
 
-			if [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UP")" -eq 1 ] || [ "$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UNKNOWN")" -eq 1 ]; then
+			# wan link state: UP, or UNKNOWN (the second check is only made when the link is not UP)
+			up_count=$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UP")
+			unknown_count=0
+
+			if [ "$up_count" -ne 1 ]; then
+				unknown_count=$(ip link show "$up_zone" 2> /dev/null | grep -c -w "state UNKNOWN")
+			fi
+
+			if [ "$up_count" -eq 1 ] || [ "$unknown_count" -eq 1 ]; then
 				# Look for ipv4 and ipv6 gateways
 				default_ipv6_gw=$(ip -6 neigh | grep "$up_zone" | grep "router" | awk '{print $1}' | awk -F ":" '$1 != "fe80" {print $0}')
 				default_ipv4_gw=$(ip -4 neigh | grep "$up_zone" | awk 'NR==1 {printf "%s", $1}')
@@ -565,7 +729,10 @@ manage_ula() {
 	claim_router_ula
 
 	# Part 2: deterministic per node ULA on all nodes (also creates the on-link /64 route)
-	node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")
+	local node_iid
+
+	node_iid=$(eui64_iid "$device_mac")
+	node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$node_iid")
 	ula_addr_add "$node_ula/64" "$id_device"
 }
 
@@ -573,7 +740,11 @@ manage_ula() {
 # Multi-router handling: first come wins (no RA)
 #############################################
 load_role() {
-	role=""; role_reason=""; ula1_misses=0; claim_delay_done=0
+	role=""
+	role_reason=""
+	ula1_misses=0
+	claim_delay_done=0
+
 	[ -f "$tmpdir/role" ] && . "$tmpdir/role"
 	is_uint "$ula1_misses" || ula1_misses=0
 }
@@ -584,7 +755,8 @@ set_role() {
 		log_notice "apmond - role change [ ${role:-none} ] -> [ $1 ]: $2"
 	fi
 
-	role="$1"; role_reason="$2"
+	role="$1"
+	role_reason="$2"
 	echo "role=\"$role\"; role_reason=\"$role_reason\"; ula1_misses=\"$ula1_misses\"; claim_delay_done=\"$claim_delay_done\"" > "$tmpdir/role"
 }
 
@@ -678,10 +850,10 @@ claim_router_ula() {
 		fi
 	fi
 
-	ula_addr_add "$router_ula/64" "$id_device" || {
+	if ! ula_addr_add "$router_ula/64" "$id_device"; then
 		set_role "backed-off" "failed to add $router_ula"
 		return 1
-	}
+	fi
 
 	# Wait for DAD to complete (default 1 probe, 1 s), then check the flags
 	local i
@@ -811,7 +983,7 @@ ms_to_dt() {
 	local time_stamp="$1"
 	local ms=$(echo "$time_stamp" | awk -F "\"" '{printf "%s", $4}')
 	local secs=$(echo "$ms" | head -c 10)
-	date_time="$(date -d "@$secs")"
+	date_time=$(date -d "@$secs")
 	# translate any spaces to underscores
 	date_time=$(echo ${date_time// /_})
 }
@@ -1540,7 +1712,9 @@ get_ap_ifname() {
 
 	# 1. netifd runtime state (ubus + jsonfilter, both in base OpenWrt)
 	if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
-		name=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@[*].interfaces[@.section='$section'].ifname" 2>/dev/null | head -n 1)
+		name=$(ubus call network.wireless status 2>/dev/null |
+			jsonfilter -e "@[*].interfaces[@.section='$section'].ifname" 2>/dev/null |
+			head -n 1)
 	fi
 
 	# 2. Explicit ifname in the wireless config
@@ -1551,9 +1725,25 @@ get_ap_ifname() {
 	# 3. Match the ssid against "iw dev" AP interfaces
 	if [ -z "$name" ] && [ -n "$ssid" ]; then
 		name=$(iw dev 2>/dev/null | awk -v ssid="$ssid" '
-			/Interface/ {ifn=$2; s=""; t=""}
-			/^[ \t]*ssid / {sub(/^[ \t]*ssid /, ""); s=$0}
-			/^[ \t]*type / {t=$2; if (t == "AP" && s == ssid) {print ifn; exit}}
+			/Interface/ {
+				ifn = $2
+				s = ""
+				t = ""
+			}
+
+			/^[ \t]*ssid / {
+				sub(/^[ \t]*ssid /, "")
+				s = $0
+			}
+
+			/^[ \t]*type / {
+				t = $2
+
+				if (t == "AP" && s == ssid) {
+					print ifn
+					exit
+				}
+			}
 		')
 	fi
 
@@ -1564,22 +1754,37 @@ get_ap_ifname() {
 # 1. the iface's option network (e.g. guest) has device <bridge>.<N> (br-lan.20) on a vlan_filtering bridge -> N
 # 2. else the ifname is a port of a vlan_filtering bridge with a single untagged VLAN in UCI bridge-vlan
 ap_vlan() {
-	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" net dev br vid master
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" net dev br vid master vlan_state
 
 	for net in $(uci -q get wireless."$1".network); do
 		dev=$(uci -q get network."$net".device)
 		case "$dev" in
 			*.*)
-				br=${dev%.*}; vid=${dev##*.}
+				br=${dev%.*}
+				vid=${dev##*.}
 				case "$vid" in ''|*[!0-9]*) continue ;; esac
-				[ "$(cat "$sysnet/$br/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && { echo "$vid"; return 0; }
+
+				vlan_state=$(cat "$sysnet/$br/bridge/vlan_filtering" 2>/dev/null)
+
+				if [ "$vlan_state" = "1" ]; then
+					echo "$vid"
+					return 0
+				fi
 			;;
 		esac
 	done
 
 	master=$(readlink "$sysnet/$2/master" 2>/dev/null)
 	master=${master##*/}
-	[ -n "$master" ] && [ "$(cat "$sysnet/$master/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_access_vlan "$master" "$2"
+
+	if [ -n "$master" ]; then
+		vlan_state=$(cat "$sysnet/$master/bridge/vlan_filtering" 2>/dev/null)
+
+		if [ "$vlan_state" = "1" ]; then
+			port_access_vlan "$master" "$2"
+		fi
+	fi
+
 	return 0
 }
 
@@ -1608,9 +1813,11 @@ get_station_block() {
 		is_station_id=$(echo "$line" | grep "^Station")
 
 		if [ ! -z "$is_station_id" ]; then
-			echo "$line" | awk '{printf "        \"%s\": {", $2}' >> "$tmpdir/apmond_block"; echo >> "$tmpdir/apmond_block"
+			echo "$line" | awk '{printf "        \"%s\": {", $2}' >> "$tmpdir/apmond_block"
+			echo >> "$tmpdir/apmond_block"
 		else
-			ap_param_str=$(echo "$line" | tr -d \\t | tr -d '"' | tr -s " " "_" | awk -F ":" '{printf "\"%s\": \"%s\"", $1, $2}'; echo)
+			# e.g. "rx bytes:<tab>1234" -> "rx_bytes": "1234"
+			ap_param_str=$(echo "$line" | tr -d \\t | tr -d '"' | tr -s " " "_" | awk -F ":" '{printf "\"%s\": \"%s\"", $1, $2}')
 			ap_param=$(echo "$ap_param_str" | awk -F "\"" '{printf "%s", $2}')
 
 			case $ap_param in
@@ -1657,7 +1864,7 @@ get_ap_data() {
 	get_device_mac
 	clients="clients@$device_mac"
 
-	local lock_timeout=4
+	local lock_timeout=4 ap_disabled ap_vlan_id
 
 	# create a lock file
 	local locked=0
@@ -1680,7 +1887,9 @@ get_ap_data() {
 
 	# Scan around the access point vifs on this node
 	for ap in $aplist; do
-		[ "$(uci -q get wireless."$ap".disabled)" = "1" ] && continue
+		ap_disabled=$(uci -q get wireless."$ap".disabled)
+		[ "$ap_disabled" = "1" ] && continue
+
 		ap_ssid=$(uci -q get wireless."$ap".ssid | tr -d '"\\')
 		ap_ifname=$(get_ap_ifname "$ap" "$ap_ssid")
 
@@ -1689,7 +1898,9 @@ get_ap_data() {
 			continue
 		fi
 
-		if get_station_block "$ap_ifname" "$ap_ssid" "$(ap_vlan "$ap" "$ap_ifname")"; then
+		ap_vlan_id=$(ap_vlan "$ap" "$ap_ifname")
+
+		if get_station_block "$ap_ifname" "$ap_ssid" "$ap_vlan_id"; then
 			ap_sta=1
 			append_block
 		fi
@@ -1698,7 +1909,8 @@ get_ap_data() {
 	# scan for ethernet connections
 	get_ethernet_clients
 
-	if [ "$ap_sta" -eq 0 ] && [ "$eth_sta" -eq 0 ]; then # don't output the json
+	if [ "$ap_sta" -eq 0 ] && [ "$eth_sta" -eq 0 ]; then
+		# no clients: don't output the json
 		log_debug "apmond - no clients detected"
 	else
 		usi_full
@@ -1720,12 +1932,14 @@ get_ap_data() {
 # network (network.lan.device, else ifstatus lan l3_device) is used when it is a VLAN subinterface
 # <bridge>.<vid> of it, e.g. br-lan.10. An explicit option device 'br-lan.10' also works (override).
 resolve_id_device() {
-	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" l3 vid parent
+	local sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" l3 vid parent vlan_state
 
 	id_device=$(get_option setup device br-lan)
 	id_bridge=""
 
-	if [ "$(cat "$sysnet/$id_device/bridge/vlan_filtering" 2>/dev/null)" = "1" ]; then
+	vlan_state=$(cat "$sysnet/$id_device/bridge/vlan_filtering" 2>/dev/null)
+
+	if [ "$vlan_state" = "1" ]; then
 		for l3 in $(uci -q get network.lan.device) $(ifstatus lan 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null); do
 			case "$l3" in
 				"$id_device".*)
@@ -1741,7 +1955,13 @@ resolve_id_device() {
 
 	# A VLAN subinterface of a bridge: bridge detection and MAC tables use the parent bridge
 	case "$id_device" in
-		*.*) parent=${id_device%.*}; [ -d "$sysnet/$parent/bridge" ] && id_bridge="$parent" ;;
+		*.*)
+			parent=${id_device%.*}
+
+			if [ -d "$sysnet/$parent/bridge" ]; then
+				id_bridge="$parent"
+			fi
+		;;
 	esac
 	id_bridge=${id_bridge:-$id_device}
 }
@@ -1752,22 +1972,63 @@ resolve_id_device() {
 # Prints nothing for a trunk / multi-VLAN / tagged-only port or a port in no bridge-vlan.
 port_access_vlan() {
 	uci -q show network 2>/dev/null | awk -v br="$1" -v port="$2" '
-		{ eq=index($0, "="); k=substr($0, 1, eq-1); v=substr($0, eq+1); n=split(k, a, ".") }
-		n == 2 && v == "bridge-vlan" { bv[a[2]]=1; next }
-		n == 3 { gsub(/\047/, "", v); f[a[2], a[3]]=v }
+		# each line is <config>.<section>[.<option>]=<value>
+		{
+			eq = index($0, "=")
+			k = substr($0, 1, eq - 1)
+			v = substr($0, eq + 1)
+			n = split(k, a, ".")
+		}
+
+		# network.<section>=bridge-vlan: remember the section
+		n == 2 && v == "bridge-vlan" {
+			bv[a[2]] = 1
+			next
+		}
+
+		# network.<section>.<option>=<value>: remember the option value, without the quotes
+		n == 3 {
+			gsub(/\047/, "", v)
+			f[a[2], a[3]] = v
+		}
+
 		END {
 			for (sec in bv) {
-				if (f[sec, "device"] != br) continue
-				c=split(f[sec, "ports"], p, " ")
-				for (i=1; i<=c; i++) {
-					m=p[i]; sub(/\*$/, "", m); t="u"
-					if (m ~ /:[ut]$/) { t=substr(m, length(m)); m=substr(m, 1, length(m)-2) }
-					if (m != port) continue
+				if (f[sec, "device"] != br) {
+					continue
+				}
+
+				c = split(f[sec, "ports"], p, " ")
+
+				for (i = 1; i <= c; i++) {
+					# a ports entry is <port>[:u|:t][*], no suffix counts as untagged
+					m = p[i]
+					sub(/\*$/, "", m)
+					t = "u"
+
+					if (m ~ /:[ut]$/) {
+						t = substr(m, length(m))
+						m = substr(m, 1, length(m) - 2)
+					}
+
+					if (m != port) {
+						continue
+					}
+
 					mem++
-					if (t == "u") vid=f[sec, "vlan"]; else tagged++
+
+					if (t == "u") {
+						vid = f[sec, "vlan"]
+					} else {
+						tagged++
+					}
 				}
 			}
-			if (mem == 1 && !tagged && vid ~ /^[0-9]+$/) print vid
+
+			# an access port: a member of exactly one VLAN, untagged
+			if (mem == 1 && !tagged && vid ~ /^[0-9]+$/) {
+				print vid
+			}
 		}'
 }
 
@@ -1775,17 +2036,33 @@ get_bridge_fdb() {
 	# Output "<ifname> <mac> [<vid>]" for every non-local mac learned on bridge $1.
 	# A vlan_filtering bridge has one fdb entry per MAC and VLAN; the VID is only known from ip-bridge
 	# (bridge fdb show), so it is preferred there. brctl/brforward give no VID.
-	local bridge="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+	local bridge="$1" sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" brif_port vlan_state
 
-	if [ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && command -v bridge >/dev/null 2>&1; then
-		bridge fdb show br "$bridge" 2>/dev/null | awk '!/permanent/ && !/self/ && $2 == "dev" {v=""; for (i=3; i<NF; i++) if ($i == "vlan") v=$(i+1); print $3, $1, v}'
+	vlan_state=$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)
+
+	if [ "$vlan_state" = "1" ] && command -v bridge >/dev/null 2>&1; then
+		# "<mac> dev <port> [vlan <vid>] ..." -> "<port> <mac> <vid>" (<vid> empty when there is none)
+		bridge fdb show br "$bridge" 2>/dev/null | awk '
+			!/permanent/ && !/self/ && $2 == "dev" {
+				v = ""
+
+				for (i = 3; i < NF; i++) {
+					if ($i == "vlan") {
+						v = $(i + 1)
+					}
+				}
+
+				print $3, $1, v
+			}'
 	elif command -v brctl >/dev/null 2>&1 && brctl showmacs "$bridge" >/dev/null 2>&1; then
 		# brctl reports a port number, map it to an interface name using sysfs
 		brctl showmacs "$bridge" 2>/dev/null | tail -n +2 | awk '$3 == "no" {print $1, $2}' | while read portno mac; do
 			for brif in "$sysnet"/"$bridge"/brif/*; do
 				[ -f "$brif/port_no" ] || continue
 
-				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
+				brif_port=$(cat "$brif/port_no")
+
+				if [ "$((brif_port))" -eq "$portno" ]; then
 					echo "${brif##*/} $mac"
 					break
 				fi
@@ -1801,7 +2078,9 @@ get_bridge_fdb() {
 			for brif in "$sysnet"/"$bridge"/brif/*; do
 				[ -f "$brif/port_no" ] || continue
 
-				if [ "$(($(cat "$brif/port_no")))" -eq "$portno" ]; then
+				brif_port=$(cat "$brif/port_no")
+
+				if [ "$((brif_port))" -eq "$portno" ]; then
 					echo "${brif##*/} $mac"
 					break
 				fi
@@ -1818,12 +2097,22 @@ get_bridge_fdb() {
 # wan_devices: the upstream device(s) (network.wan / wan6 device and ifname), "" if wan is disabled.
 # mesh11sd trunk modes (portal_detect 4/5) disable wan and move its port onto br-tun<id> as a LAN port.
 wan_devices() {
-	local w
+	local w wan_disabled
 
 	wan_devs=" "
-	[ "$(uci -q get network.wan.disabled)" = "1" ] && return 0
+	wan_disabled=$(uci -q get network.wan.disabled)
+	[ "$wan_disabled" = "1" ] && return 0
+
 	for w in $(uci -q get network.wan.device) $(uci -q get network.wan.ifname) $(uci -q get network.wan6.device); do
-		case "$wan_devs" in *" $w "*) ;; *) wan_devs="$wan_devs$w " ;; esac
+		# add each device once
+		case "$wan_devs" in
+			*" $w "*)
+			;;
+
+			*)
+				wan_devs="$wan_devs$w "
+			;;
+		esac
 	done
 }
 
@@ -1843,27 +2132,39 @@ detect_bridges() {
 	# VLAN subinterfaces (br-lan.10) have no bridge/ dir, so they are never taken as separate bridges
 	for d in "$sysnet/${id_bridge:-$id_device}/bridge" "$sysnet"/*/bridge; do
 		[ -d "$d" ] || continue
-		br=${d%/bridge}; br=${br##*/}
+		br=${d%/bridge}
+		br=${br##*/}
 		case " $found " in *" $br "*) continue ;; esac
 		case "$wan_devs" in *" $br "*) continue ;; esac
-		members=0; up=0
+		members=0
+		up=0
 
 		for brif in "$sysnet/$br"/brif/*; do
 			[ -e "$brif" ] || continue
 			m=${brif##*/}
-			case "$wan_devs" in *" $m "*) up=1; break ;; esac
+
+			case "$wan_devs" in
+				*" $m "*)
+					# a wan device is a member: this is the upstream bridge
+					up=1
+					break
+				;;
+			esac
+
 			case "$m" in vxlan*) continue ;; esac
 			members=$((members+1))
 		done
 
-		[ "$up" -eq 0 ] && [ "$members" -gt 0 ] && found="${found:+$found }$br"
+		if [ "$up" -eq 0 ] && [ "$members" -gt 0 ]; then
+			found="${found:+$found }$br"
+		fi
 	done
 
 	bridges="$found"
 }
 
 get_ethernet_clients() {
-	local first=1 sysnet="${APMOND_SYSFS_NET:-/sys/class/net}"
+	local first=1 sysnet="${APMOND_SYSFS_NET:-/sys/class/net}" vlan_state
 
 	detect_bridges
 	wan_devices
@@ -1896,21 +2197,55 @@ get_ethernet_clients() {
 
 			# One entry per MAC (a JSON key can't repeat): a MAC seen in several VLANs gets its VIDs comma-joined, ascending
 			macs=$(awk -v p="$port" '$1 == p {
-				if (!($2 in v)) { o[++n]=$2; v[$2]="" }
-				if ($3 != "" && index("," v[$2] ",", "," $3 ",") == 0) v[$2]=(v[$2] == "" ? $3 : v[$2] "," $3)
+				# first time this MAC is seen: keep the order, start with no VIDs
+				if (!($2 in v)) {
+					o[++n] = $2
+					v[$2] = ""
+				}
+
+				# add this VID to the MAC, once
+				if ($3 != "" && index("," v[$2] ",", "," $3 ",") == 0) {
+					v[$2] = (v[$2] == "" ? $3 : v[$2] "," $3)
+				}
 			} END {
-				for (i=1; i<=n; i++) {
-					c=split(v[o[i]], a, ",")
-					for (j=2; j<=c; j++) { t=a[j]; k=j-1; while (k>0 && a[k]+0 > t+0) { a[k+1]=a[k]; k-- } a[k+1]=t }
-					s=""; for (j=1; j<=c; j++) s=(s == "" ? a[j] : s "," a[j])
+				for (i = 1; i <= n; i++) {
+					c = split(v[o[i]], a, ",")
+
+					# sort the VIDs, numerically (insertion sort)
+					for (j = 2; j <= c; j++) {
+						t = a[j]
+						k = j - 1
+
+						while (k > 0 && a[k] + 0 > t + 0) {
+							a[k + 1] = a[k]
+							k--
+						}
+
+						a[k + 1] = t
+					}
+
+					# join them again with ","
+					s = ""
+
+					for (j = 1; j <= c; j++) {
+						s = (s == "" ? a[j] : s "," a[j])
+					}
+
 					print o[i] "|" s
 				}
 			}' "$tmpdir/fdb")
+
 			[ -z "$macs" ] && continue
 			get_eth_stats "$port" || continue
 			# Access port VLAN from UCI (no ip-bridge needed); a per-MAC VID from bridge fdb takes precedence
 			port_vid=""
-			[ "$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)" = "1" ] && port_vid=$(port_access_vlan "$bridge" "$port")
+
+			vlan_state=$(cat "$sysnet/$bridge/bridge/vlan_filtering" 2>/dev/null)
+
+			if [ "$vlan_state" = "1" ]; then
+				port_vid=$(port_access_vlan "$bridge" "$port")
+			fi
+
 			eth_sta=1 # flag that we have some stations
 			echo "      \"$port@$bridge\": {" > "$tmpdir/apmond_block"
 
@@ -1919,7 +2254,7 @@ get_ethernet_clients() {
 				[ -z "$vids" ] && vids="$port_vid"
 				mac=${mac%%|*}
 				timestamp=$(date +%s)000
-				date_time="$(date -d "@${timestamp:0:10}")"
+				date_time=$(date -d "@${timestamp:0:10}")
 				date_time=$(echo ${date_time// /_})
 				echo "        \"$mac\": {" >> "$tmpdir/apmond_block"
 				echo "          \"rx_bytes\": \"$rx_bytes\"," >> "$tmpdir/apmond_block"
@@ -1998,10 +2333,17 @@ get_link_speed() {
 	esac
 
 	if [ -n "$vid" ]; then
-		speed=$(swconfig_vlan_speed "$vid") && [ -n "$speed" ] && { echo "$speed"; return 0; }
+		if speed=$(swconfig_vlan_speed "$vid") && [ -n "$speed" ]; then
+			echo "$speed"
+			return 0
+		fi
 	fi
 
-	[ "$oper" = "down" ] && { echo "down"; return 0; }
+	if [ "$oper" = "down" ]; then
+		echo "down"
+		return 0
+	fi
+
 	echo "unknown"
 }
 
@@ -2079,6 +2421,9 @@ get_system_stats_json() {
 	echo "      \"apmond_checksum\": \"$checksum\","
 	echo "      \"factory_mac\": \"$factory_mac\","
 	echo "      \"device_mac\": \"$device_mac\","
+	# apmond: this node's apmond ULA and IPv4 addresses, so the collector can show and link to it.
+	# Extra node_status keys: older apmond and mesh11sd collectors store and show the report as they are.
+	node_status_addresses
 	echo "      \"uptime_seconds\": ${uptime_sec:-0},"
 	echo "      \"load_average_1min\": \"$load1\","
 	echo "      \"load_average_5min\": \"$load5\","
@@ -2088,6 +2433,55 @@ get_system_stats_json() {
 	echo "      \"cpu_temperature_c\": \"$cpu_temp\","
 	echo "      \"cpu_frequency_mhz\": \"$cpu_freq\""
 	echo "    },"
+}
+
+# node_ula_addr: this node's apmond ULA, the same address show_status prints as node_ula,
+# or "unknown" when there is no ULA prefix (no passphrase) or no device MAC
+node_ula_addr() {
+	local node_iid
+
+	if [ -z "$ula_base" ] || [ -z "$device_mac" ] || [ "$device_mac" = "unknown" ]; then
+		echo "unknown"
+		return 0
+	fi
+
+	node_iid=$(eui64_iid "$device_mac")
+	ipv6_canon "$ula_base:$ula_subnet:$node_iid"
+}
+
+# node_ipv4_addrs: every IPv4 address (a.b.c.d/len, as ip prints it) on option device and the configured
+# bridges, the interfaces show_status lists ula_addresses for, one per line, each address once
+node_ipv4_addrs() {
+	local ifaces="" i
+
+	for i in $id_device $bridge_list; do
+		# list each interface once
+		case " $ifaces " in
+			*" $i "*)
+			;;
+
+			*)
+				ifaces="$ifaces $i"
+			;;
+		esac
+	done
+
+	for i in $ifaces; do
+		ip -4 addr show dev "$i" 2>/dev/null | awk '$1 == "inet" {print $2}'
+	done | awk '!seen[$0]++'
+}
+
+# node_status_addresses: the node_ula and ipv4_addresses lines of node_status (6 space indent, both end with ",")
+node_status_addresses() {
+	local ula addrs
+
+	ula=$(node_ula_addr)
+	json_field "      " node_ula "$ula"
+
+	addrs=$(node_ipv4_addrs)
+	printf '      "ipv4_addresses": '
+	json_array "      " $addrs
+	echo ","
 }
 
 usi_full() {
@@ -2109,6 +2503,85 @@ usi_full() {
 server_url() {
 	# The collector is always the router at <ula_base>:<ula_subnet>::1, as the mesh11sd portal
 	echo "${APMOND_TEST_SCHEME:-https}://[$router_ula]:$port$cgi_path"
+}
+
+# last_send_clean <key> <value>: prints <value> keeping only the characters allowed for that last_send field.
+# last_status is the first word of the collector's reply, so it can be anything: never let a quote, $, ` or \ through.
+last_send_clean() {
+	case "$1" in
+		last_send)
+			# date output, e.g. "Tue Oct 27 15:52:00 GMT 2026"
+			printf '%s' "$2" | tr -cd 'A-Za-z0-9 :+._-'
+		;;
+
+		last_status)
+			# e.g. "*end", "*spider" or "nack", at most 64 characters
+			printf '%s' "$2" | tr -cd '*A-Za-z0-9._-' | head -c 64
+		;;
+
+		last_retcode|last_bytes)
+			printf '%s' "$2" | tr -cd '0-9'
+		;;
+	esac
+}
+
+# write_last_send <date> <status> <retcode> <bytes>: records the last send in $tmpdir/last_send, one key="value"
+# per line, every value cleaned by last_send_clean. show_status reads it back with read_last_send, never with "."
+write_last_send() {
+	local clean_date clean_status clean_retcode clean_bytes
+
+	clean_date=$(last_send_clean last_send "$1")
+	clean_status=$(last_send_clean last_status "$2")
+	clean_retcode=$(last_send_clean last_retcode "$3")
+	clean_bytes=$(last_send_clean last_bytes "$4")
+
+	{
+		printf 'last_send="%s"\n' "$clean_date"
+		printf 'last_status="%s"\n' "$clean_status"
+		printf 'last_retcode="%s"\n' "$clean_retcode"
+		printf 'last_bytes="%s"\n' "$clean_bytes"
+	} > "$tmpdir/last_send"
+}
+
+# read_last_send <file>: sets last_send, last_status, last_retcode and last_bytes from the file written by
+# write_last_send, without sourcing it: only these four keys are taken and each value is cleaned again,
+# so even an edited file cannot run anything. The single ";" separated line written by apmond 1.0.0 is read too.
+read_last_send() {
+	local content key value
+
+	last_send=""
+	last_status=""
+	last_retcode=""
+	last_bytes=""
+
+	# one key="value" per line (1.0.0: all on one line, separated by "; ")
+	content=$(tr ';' '\n' < "$1" | sed 's/^ *//')
+
+	while IFS='=' read -r key value; do
+		# drop the quotes around the value
+		value="${value#\"}"
+		value="${value%\"}"
+
+		case "$key" in
+			last_send)
+				last_send=$(last_send_clean last_send "$value")
+			;;
+
+			last_status)
+				last_status=$(last_send_clean last_status "$value")
+			;;
+
+			last_retcode)
+				last_retcode=$(last_send_clean last_retcode "$value")
+			;;
+
+			last_bytes)
+				last_bytes=$(last_send_clean last_bytes "$value")
+			;;
+		esac
+	done <<EOF
+$content
+EOF
 }
 
 send_request() {
@@ -2231,7 +2704,11 @@ send_ap_data() {
 		log_warning "apmond - unable to reach server [ $apmon_url ], return code [ $retcode ] - $seed_hint"
 	fi
 
-	echo "last_send=\"$(date)\"; last_status=\"${send_status:-none}\"; last_retcode=\"$retcode\"; last_bytes=\"$hexencoded_len\"" > "$tmpdir/last_send"
+	local send_date
+
+	send_date=$(date)
+	write_last_send "$send_date" "${send_status:-none}" "$retcode" "$hexencoded_len"
+
 	return "$retcode"
 }
 
@@ -2250,14 +2727,42 @@ nack() {
 # report (mixed versions are normal while island meshes / cabled AP groups are upgraded), it is logged
 # once per node per protocol value (state in the volatile run dir) and a notice is logged when back in line.
 check_node_protocol() {
-	local node="$1" file="$2" proto state="$tmpdir/protocol_mismatch/$1"
+	local node="$1" file="$2" proto state="$tmpdir/protocol_mismatch/$1" logged_proto
 
 	# hex of: "apmond_protocol": "
-	proto=$(awk 'BEGIN { for (i = 32; i < 127; i++) h[sprintf("%02x", i)] = sprintf("%c", i) }
-		{ p = index($0, "2261706d6f6e645f70726f746f636f6c223a2022"); if (!p) exit
-		  s = substr($0, p + 40, 64); v = ""
-		  for (i = 1; i < length(s); i += 2) { c = substr(s, i, 2); if (c == "22") break; v = v h[c] }
-		  print v; exit }' "$file" 2>/dev/null | tr -cd '0-9A-Za-z._-')
+	proto=$(awk '
+		BEGIN {
+			# hex pair -> printable character
+			for (i = 32; i < 127; i++) {
+				h[sprintf("%02x", i)] = sprintf("%c", i)
+			}
+		}
+
+		{
+			p = index($0, "2261706d6f6e645f70726f746f636f6c223a2022")
+
+			if (!p) {
+				exit
+			}
+
+			# the value starts after the 40 hex characters of the key: decode it up to its closing quote (hex 22)
+			s = substr($0, p + 40, 64)
+			v = ""
+
+			for (i = 1; i < length(s); i += 2) {
+				c = substr(s, i, 2)
+
+				if (c == "22") {
+					break
+				}
+
+				v = v h[c]
+			}
+
+			print v
+			exit
+		}' "$file" 2>/dev/null | tr -cd '0-9A-Za-z._-')
+
 	if [ -z "$proto" ]; then
 		# mesh11sd-format report (node_status.mesh11sd_version, no apmond_protocol): mesh11sd sends the
 		# protocol 1 format, so it is compatible - note it once at debug level, no warning
@@ -2282,7 +2787,15 @@ check_node_protocol() {
 		return 0
 	fi
 
-	[ -f "$state" ] && [ "$(cat "$state")" = "$proto" ] && return 0
+	# already logged for this protocol value: nothing more to say
+	if [ -f "$state" ]; then
+		logged_proto=$(cat "$state")
+
+		if [ "$logged_proto" = "$proto" ]; then
+			return 0
+		fi
+	fi
+
 	echo "$proto" > "$state"
 
 	if [ "$proto" = "0" ]; then
@@ -2294,6 +2807,8 @@ check_node_protocol() {
 }
 
 write_node_data() {
+	local staged_session
+
 	node_id="$1"
 	data_raw="$2"
 
@@ -2317,8 +2832,14 @@ write_node_data() {
 	IFS=";"
 	set -- $node_id
 	IFS="$oldifs"
-	node_type="$1"; node_hostname="$2"; node_mac_raw="$3"; chunkstatus="$4"; strindex="$5"
-	node_ts="$6"; node_hash="$7"; node_sig="$8"
+	node_type="$1"
+	node_hostname="$2"
+	node_mac_raw="$3"
+	chunkstatus="$4"
+	strindex="$5"
+	node_ts="$6"
+	node_hash="$7"
+	node_sig="$8"
 
 	if [ "$node_type" != "apmond" ]; then
 		nack "Invalid node type"
@@ -2326,7 +2847,10 @@ write_node_data() {
 	fi
 
 	case "$node_hostname" in
-		""|*[!A-Za-z0-9._-]*) nack "Bad node hostname"; return 1;;
+		""|*[!A-Za-z0-9._-]*)
+			nack "Bad node hostname"
+			return 1
+		;;
 	esac
 
 	node_mac=$(echo "$node_mac_raw" | awk -F ":" 'NF==6 {printf "%s%s%s%s%s%s", $1, $2, $3, $4, $5, $6}')
@@ -2339,8 +2863,13 @@ write_node_data() {
 	node_mac=$(echo "$node_mac" | tr 'A-F' 'a-f')
 
 	case "$chunkstatus" in
-		begin|chunk|end|spider) ;;
-		*) nack "Invalid chunk status"; return 1;;
+		begin|chunk|end|spider)
+		;;
+
+		*)
+			nack "Invalid chunk status"
+			return 1
+		;;
 	esac
 
 	if ! is_uint "$strindex" || ! is_uint "$node_ts"; then
@@ -2408,7 +2937,13 @@ write_node_data() {
 		;;
 
 		chunk|end)
-			if [ ! -f "$staging.session" ] || [ "$(cat "$staging.session")" != "$session" ]; then
+			staged_session=""
+
+			if [ -f "$staging.session" ]; then
+				staged_session=$(cat "$staging.session")
+			fi
+
+			if [ ! -f "$staging.session" ] || [ "$staged_session" != "$session" ]; then
 				nack "No matching begin for this report"
 				return 1
 			fi
@@ -2479,7 +3014,7 @@ show_help() {
   option: help, -h, --help
 	Show this help
 
-  option: version
+  option: version, -v, --version
 	Print the version of apmond
 
   option: status
@@ -2520,6 +3055,8 @@ show_help() {
 }
 
 show_ap_data() {
+	local report_hex
+
 	data_nodes=$(ls "$datadir/apmond_data/" 2>/dev/null | awk '{printf "%s ", $1}')
 
 	if [ "$1" = "all" ]; then
@@ -2531,7 +3068,8 @@ show_ap_data() {
 		all_first=1
 
 		for data_node in $data_nodes; do
-			hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$data_node" 2>/dev/null)"
+			report_hex=$(awk '{printf "%s", $2}' "$datadir/apmond_data/$data_node" 2>/dev/null)
+			hex_to_str "$report_hex"
 
 			if [ ! -z "$str" ]; then
 				str=$(echo -n "$str" | tail -n +2 | head -n -2)
@@ -2579,7 +3117,8 @@ show_ap_data() {
 			exit 1
 		fi
 
-		hex_to_str "$(awk '{printf "%s", $2}'  "$datadir/apmond_data/$node" 2>/dev/null)"
+		report_hex=$(awk '{printf "%s", $2}' "$datadir/apmond_data/$node" 2>/dev/null)
+		hex_to_str "$report_hex"
 
 		if [ ! -z "$str" ]; then
 			echo "$str"
@@ -2597,7 +3136,7 @@ json_str() {
 # json_array <indent> <items...>: prints a JSON array body the way jq . does: "[]" if empty, otherwise
 # "[", one element per line indented <indent>+2 spaces, and "]" at <indent> (caller prints key and trailing comma)
 json_array() {
-	local ind="$1" sep="" it
+	local ind="$1" sep="" it escaped
 	shift
 	if [ "$#" -eq 0 ]; then
 		printf '[]'
@@ -2605,10 +3144,25 @@ json_array() {
 	fi
 	printf '['
 	for it in "$@"; do
-		printf '%s\n%s  "%s"' "$sep" "$ind" "$(json_str "$it")"
+		# escape the item for JSON first, then print it on its own line, indented
+		escaped=$(json_str "$it")
+		printf '%s\n%s  "%s"' "$sep" "$ind" "$escaped"
 		sep=","
 	done
 	printf '\n%s]' "$ind"
+}
+
+# json_field <indent> <key> <value> [last]: prints <indent>"key": "value", with the value escaped.
+# Pass "last" to leave off the trailing comma (for the final field in an object).
+json_field() {
+	local escaped
+	escaped=$(json_str "$3")
+
+	if [ "$4" = "last" ]; then
+		printf '%s"%s": "%s"\n' "$1" "$2" "$escaped"
+	else
+		printf '%s"%s": "%s",\n' "$1" "$2" "$escaped"
+	fi
 }
 
 # daemon_pid: pid of a running "apmond daemon" (BusyBox: scan /proc)
@@ -2619,7 +3173,10 @@ daemon_pid() {
 		# the pid may exit between the glob and the read: the group redirect also silences ash's "can't open"
 		cmd=$({ tr '\000' ' ' < "$d/cmdline"; } 2>/dev/null)
 		case "$cmd" in
-			*apmond\ daemon*) echo "${d#/proc/}"; return 0 ;;
+			*apmond\ daemon*)
+				echo "${d#/proc/}"
+				return 0
+			;;
 		esac
 	done
 	return 1
@@ -2628,89 +3185,130 @@ daemon_pid() {
 # show_status: JSON, same style as node_status in show_ap_data. Never shows the passphrase or the secret (nor apmon_id, derived from it).
 show_status() {
 	local seed_default="no" b sep pid running="no" running_checksum ifaces="" i addrs a first aps
+	local bridge_detect_mode node_iid status_node_ula escaped
 
 	[ "$default_seed_in_use" -eq 1 ] && seed_default="yes"
 	pid=$(daemon_pid) && running="yes"
 	aps=$(ls "$datadir/apmond_data/" 2>/dev/null | wc -l)
 
 	echo "{"
-	echo "  \"apmond_status\": {"
-	echo "    \"apmond_version\": \"$(json_str "$version")\","
-	echo "    \"apmond_protocol\": \"$(json_str "$protocol_version")\","
+	echo '  "apmond_status": {'
+	json_field "    " apmond_version "$version"
+	json_field "    " apmond_protocol "$protocol_version"
+
 	# checksum: the running daemon's own hash (written at daemon start); the script's hash when no daemon runs.
 	# installed_checksum: sha256 of /usr/sbin/apmond as installed on disk now. They differ after an upgrade without a restart.
 	running_checksum="$checksum"
-	[ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ] && { read -r running_checksum < "$tmpdir/daemon_checksum"; } 2>/dev/null
-	echo "    \"checksum\": \"$(json_str "$running_checksum")\","
-	echo "    \"installed_checksum\": \"$checksum\","
-	[ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ] && echo "    \"checksum_warning\": \"running daemon differs from /usr/sbin/apmond - restart apmond\","
-	echo "    \"enabled\": \"$(json_str "$enabled")\","
-	echo "    \"daemon_running\": \"$running\","
-	echo "    \"daemon_pid\": \"${pid:-none}\","
-	echo "    \"interval_seconds\": \"$(json_str "$interval")\","
-	echo "    \"debuglevel\": \"$(json_str "$debuglevel")\","
-	echo "    \"router_detect\": \"$(json_str "$router_detect")\","
-	echo "    \"default_passphrase\": \"$seed_default\","
-	[ "$seed_default" = "yes" ] && echo "    \"passphrase_warning\": \"The built-in default passphrase is in use. Make ApmonD more secure by setting option apmon_seed in /etc/config/apmond (the same on every node)\","
+
+	if [ "$running" = "yes" ] && [ -s "$tmpdir/daemon_checksum" ]; then
+		{ read -r running_checksum < "$tmpdir/daemon_checksum"; } 2>/dev/null
+	fi
+
+	json_field "    " checksum "$running_checksum"
+	json_field "    " installed_checksum "$checksum"
+
+	if [ "$running" = "yes" ] && [ "$running_checksum" != "$checksum" ]; then
+		json_field "    " checksum_warning "running daemon differs from /usr/sbin/apmond - restart apmond"
+	fi
+
+	json_field "    " enabled "$enabled"
+	json_field "    " daemon_running "$running"
+	json_field "    " daemon_pid "${pid:-none}"
+	json_field "    " interval_seconds "$interval"
+	json_field "    " debuglevel "$debuglevel"
+	json_field "    " router_detect "$router_detect"
+	json_field "    " default_passphrase "$seed_default"
+
+	if [ "$seed_default" = "yes" ]; then
+		json_field "    " passphrase_warning "The built-in default passphrase is in use. Make ApmonD more secure by setting option apmon_seed in /etc/config/apmond (the same on every node)"
+	fi
 
 	if [ -n "$apmon_seed" ]; then
 		get_device_mac
 		[ -f "$tmpdir/is_router" ] && . "$tmpdir/is_router"
 		load_role
-		echo "    \"ula_prefix\": \"$(json_str "$ula_prefix")\","
-		echo "    \"ula_subnet\": \"$(json_str "$ula_subnet")\","
-		echo "    \"collector\": \"$(json_str "$router_ula")\","
-		echo "    \"device\": \"$(json_str "$id_device")\","
-		echo "    \"ap_mac_id\": \"$(json_str "$device_mac")\","
+		json_field "    " ula_prefix "$ula_prefix"
+		json_field "    " ula_subnet "$ula_subnet"
+		json_field "    " collector "$router_ula"
+		json_field "    " device "$id_device"
+		json_field "    " ap_mac_id "$device_mac"
 		detect_bridges
-		echo "    \"bridge_detect\": \"$([ "$bridge_auto" -eq 1 ] && echo auto || echo list)\","
+
+		if [ "$bridge_auto" -eq 1 ]; then
+			bridge_detect_mode="auto"
+		else
+			bridge_detect_mode="list"
+		fi
+
+		json_field "    " bridge_detect "$bridge_detect_mode"
 		printf '    "bridges": '
 		json_array "    " $bridges
 		echo ","
-		echo "    \"role\": \"$(json_str "${role:-unknown (daemon not run yet)}")\","
-		echo "    \"role_reason\": \"$(json_str "${role_reason:-none}")\","
-		echo "    \"node_ula\": \"$(ipv6_canon "$ula_base:$ula_subnet:$(eui64_iid "$device_mac")")\","
+		json_field "    " role "${role:-unknown (daemon not run yet)}"
+		json_field "    " role_reason "${role_reason:-none}"
+
+		node_iid=$(eui64_iid "$device_mac")
+		status_node_ula=$(ipv6_canon "$ula_base:$ula_subnet:$node_iid")
+		json_field "    " node_ula "$status_node_ula"
 
 		for i in $id_device $bridge_list; do
-			case " $ifaces " in *" $i "*) ;; *) ifaces="$ifaces $i" ;; esac
+			# list each interface once
+			case " $ifaces " in
+				*" $i "*)
+				;;
+
+				*)
+					ifaces="$ifaces $i"
+				;;
+			esac
 		done
-		echo "    \"ula_addresses\": {"
+
+		echo '    "ula_addresses": {'
 		first=1
 		# kernel shows addresses in canonical form (no leading zeros in a group): compare canonical prefixes
 		ula_base_c=$(echo "$ula_base" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g')
+
 		for i in $ifaces; do
 			addrs=$(ip -6 addr show dev "$i" 2>/dev/null | awk -v p="$ula_base_c:" '$1=="inet6" && index($2,p)==1 {print $2}')
 			[ "$first" -eq 1 ] || echo ","
 			first=0
-			printf '      "%s": ' "$(json_str "$i")"
+			escaped=$(json_str "$i")
+			printf '      "%s": ' "$escaped"
 			json_array "      " $addrs
 		done
+
 		echo
 		echo "    },"
 	fi
 
 	if [ -f "$tmpdir/last_send" ]; then
-		. "$tmpdir/last_send"
-		echo "    \"last_send\": {"
-		echo "      \"date_time\": \"$(json_str "$last_send")\","
-		echo "      \"status\": \"$(json_str "$last_status")\","
-		echo "      \"retcode\": \"$(json_str "$last_retcode")\","
-		echo "      \"bytes\": \"$(json_str "$last_bytes")\""
+		read_last_send "$tmpdir/last_send"
+		echo '    "last_send": {'
+		json_field "      " date_time "$last_send"
+		json_field "      " status "$last_status"
+		json_field "      " retcode "$last_retcode"
+		json_field "      " bytes "$last_bytes" last
 		echo "    },"
 	fi
 
-	echo "    \"log_mountpoint\": \"$(json_str "$log_mountpoint")\","
-	echo "    \"ap_data_dir\": \"$(json_str "$datadir/apmond_data")\","
-	[ -n "$datadir_reason" ] && echo "    \"storage_warning\": \"$(json_str "$datadir_reason")\","
-	echo "    \"log_file\": \"$(json_str "$logfile")\","
-	echo "    \"cgi_dir\": \"$(json_str "$cgi_dir")\","
-	if [ -n "$log_disabled_reason" ]; then
-		echo "    \"logging\": \"DISABLED: $(json_str "$log_disabled_reason")\","
-	else
-		echo "    \"logging\": \"enabled\","
+	json_field "    " log_mountpoint "$log_mountpoint"
+	json_field "    " ap_data_dir "$datadir/apmond_data"
+
+	if [ -n "$datadir_reason" ]; then
+		json_field "    " storage_warning "$datadir_reason"
 	fi
-	echo "    \"runtime_dir\": \"$(json_str "$tmpdir")\","
-	echo "    \"access_points_with_data\": \"$aps\","
+
+	json_field "    " log_file "$logfile"
+	json_field "    " cgi_dir "$cgi_dir"
+
+	if [ -n "$log_disabled_reason" ]; then
+		json_field "    " logging "DISABLED: $log_disabled_reason"
+	else
+		json_field "    " logging "enabled"
+	fi
+
+	json_field "    " runtime_dir "$tmpdir"
+	json_field "    " access_points_with_data "$aps"
 	printf '    "protocol_mismatch_nodes": '
 	json_array "    " $(ls "$tmpdir/protocol_mismatch/" 2>/dev/null)
 	echo
@@ -2770,9 +3368,13 @@ daemon_loop_once() {
 }
 
 run_daemon() {
+	local seed_warning_now
+
 	if [ "$enabled" != "1" ]; then
 		log_notice "apmond - disabled (apmond.setup.enabled=0), idle"
-		while true; do sleep 3600 & wait $!; done
+		while true; do
+			sleep 3600 & wait $!
+		done
 	fi
 
 
@@ -2793,9 +3395,13 @@ run_daemon() {
 	while true; do
 		reload_debuglevel
 
-		if [ "$default_seed_in_use" -eq 1 ] && [ $(( $(date +%s) - last_seed_warning )) -ge "$default_seed_warn_interval" ]; then
-			warn_default_seed
-			last_seed_warning=$(date +%s)
+		if [ "$default_seed_in_use" -eq 1 ]; then
+			seed_warning_now=$(date +%s)
+
+			if [ $((seed_warning_now - last_seed_warning)) -ge "$default_seed_warn_interval" ]; then
+				warn_default_seed
+				last_seed_warning=$(date +%s)
+			fi
 		fi
 
 		daemon_loop_once
@@ -2817,17 +3423,67 @@ if [ "$1" != "daemon" ]; then
 fi
 
 case "$1" in
-	""|-h|--help|help) show_help;;
-	version) echo "apmond version $version";;
-	status) show_status;;
-	debuglevel) set_debuglevel "$2"; exit $?;;
-	show_ap_data) show_ap_data "$2";;
-	get_ap_data) get_ap_data; exit 0;;
-	send) send_ap_data; exit $?;;
-	read_log) read_log "$2";;
-	detect) get_router_state; manage_ula; echo "$role";;
-	cleanup) cleanup_ula; rm -f "$tmpdir/entrynum" "$tmpdir/daemon_checksum";;
-	daemon) entrynum_file="$tmpdir/entrynum"; mkdir -p "$tmpdir"; echo 0 > "$entrynum_file"; run_daemon;;
-	write_node_data) write_node_data "$2" "$3"; exit $?;;
-	*) echo "Unknown option [ $1 ]"; show_help; exit 1;;
+	""|-h|--help|help)
+		show_help
+	;;
+
+	version|-v|--version)
+		echo "apmond version $version"
+	;;
+
+	status)
+		show_status
+	;;
+
+	debuglevel)
+		set_debuglevel "$2"
+		exit $?
+	;;
+
+	show_ap_data)
+		show_ap_data "$2"
+	;;
+
+	get_ap_data)
+		get_ap_data
+		exit 0
+	;;
+
+	send)
+		send_ap_data
+		exit $?
+	;;
+
+	read_log)
+		read_log "$2"
+	;;
+
+	detect)
+		get_router_state
+		manage_ula
+		echo "$role"
+	;;
+
+	cleanup)
+		cleanup_ula
+		rm -f "$tmpdir/entrynum" "$tmpdir/daemon_checksum"
+	;;
+
+	daemon)
+		entrynum_file="$tmpdir/entrynum"
+		mkdir -p "$tmpdir"
+		echo 0 > "$entrynum_file"
+		run_daemon
+	;;
+
+	write_node_data)
+		write_node_data "$2" "$3"
+		exit $?
+	;;
+
+	*)
+		echo "Unknown option [ $1 ]"
+		show_help
+		exit 1
+	;;
 esac

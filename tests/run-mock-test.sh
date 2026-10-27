@@ -288,7 +288,8 @@ sleep 1; C send && ok "report accepted again with the passphrase restored" || ko
 echo "== 5. large report, chunked"
 sleep 1
 MOCK_STATIONS=150 C send; rc=$?
-. "$W/run-C/last_send"
+# last_send is data, never sourced (see 5e): take last_bytes with sed
+last_bytes=$(sed -n 's/^last_bytes="\([0-9]*\)"$/\1/p' "$W/run-C/last_send")
 R show_ap_data "$CID" > "$W/big.json"
 n=$(grep -c '"02:00:00:00:' "$W/big.json")
 [ "$rc" -eq 0 ] && [ "$n" -eq 151 ] && json_ok < "$W/big.json" && ok "large report: $last_bytes hex chars in $(( (last_bytes + 2047) / 2048 )) chunks, 151 stations, valid JSON" || ko "large report rc=$rc stations=$n"
@@ -366,8 +367,45 @@ for i in 1 2 3 4 5 6 7 8; do raw "apmond;t$i;$CMAC;begin;0;1;$(printf %064d 0);$
 [ "$(wc -l < "$LF")" -le 6 ] && ok "max_log_entries: log truncated to the last N lines" || ko "truncation $(wc -l < "$LF")"
 cp "$W/r2.bak" "$W/uci-R/apmond"
 
+echo "== 5e. hostile collector reply: last_send is sanitised and never sourced"
+# Whatever answers at [<ula>::1]:443 chooses the reply; its first word is recorded as last_status.
+# A fake wget plays the rogue collector. Nothing may run, and status must stay valid JSON.
+mkdir -p "$W/hostile"
+cat > "$W/hostile/wget" <<'EOW'
+#!/bin/sh
+printf '%s' "$HOSTILE_REPLY"
+EOW
+chmod +x "$W/hostile/wget"
+ls_field() { "$PY" -c 'import json,sys; print(json.load(sys.stdin)["apmond_status"]["last_send"][sys.argv[1]])' "$1"; }
+for reply in 'x";touch '"$W"'/pwned;"' '$(touch '"$W"'/pwned)' '$(touch${IFS}'"$W"'/pwned)' '`touch${IFS}'"$W"'/pwned`' 'a"$(touch${IFS}'"$W"'/pwned)"b'; do
+	rm -f "$W/pwned"
+	HOSTILE_REPLY="$reply" PATH="$W/hostile:$PATH" C send >/dev/null 2>&1
+	C status > "$W/hostile.json" 2>/dev/null
+	want=$(printf '%s' "$reply" | awk 'NF {printf "%s", $1; exit}' | tr -cd '*A-Za-z0-9._-' | head -c 64)
+	got=$(ls_field status < "$W/hostile.json" 2>/dev/null)
+	[ ! -e "$W/pwned" ] && json_ok < "$W/hostile.json" && [ "$got" = "$want" ] && [ "$(ls_field retcode < "$W/hostile.json")" = 0 ] && ok "hostile reply [$reply]: nothing run, status valid JSON, last_send status [$got]" || ko "hostile reply [$reply]: pwned=$([ -e "$W/pwned" ] && echo yes || echo no) status [$got] want [$want]"
+done
+# a tampered last_send file is read as data too
+rm -f "$W/pwned"
+cp "$W/run-C/last_send" "$W/ls.bak"
+printf '%s\n' 'last_status="$(touch '"$W"'/pwned)"' 'last_send=x; touch '"$W"'/pwned' 'last_retcode=`touch '"$W"'/pwned`' 'last_bytes="12"' > "$W/run-C/last_send"
+C status > "$W/tampered.json" 2>/dev/null
+[ ! -e "$W/pwned" ] && json_ok < "$W/tampered.json" && [ "$(ls_field bytes < "$W/tampered.json")" = 12 ] && ok "tampered last_send file: nothing run, status valid JSON" || ko "tampered last_send file"
+# the ";" separated single line of apmond 1.0.0 still reads
+echo 'last_send="Tue Oct 27 15:52:00 GMT 2026"; last_status="*end"; last_retcode="0"; last_bytes="4096"' > "$W/run-C/last_send"
+[ "$(C status | jv last_send)" = '{"date_time": "Tue Oct 27 15:52:00 GMT 2026", "status": "*end", "retcode": "0", "bytes": "4096"}' ] && ok "1.0.0 format last_send read without sourcing" || ko "1.0.0 last_send: $(C status | jv last_send)"
+cp "$W/ls.bak" "$W/run-C/last_send"
+# a normal send shows exactly as before
+sleep 1; C send >/dev/null 2>&1; rc=$?
+C status > "$W/normal.json"
+[ "$rc" -eq 0 ] && [ "$(ls_field status < "$W/normal.json")" = "*end" ] && [ "$(ls_field retcode < "$W/normal.json")" = 0 ] && ls_field bytes < "$W/normal.json" | grep -qx '[0-9][0-9]*' && ls_field date_time < "$W/normal.json" | grep -qx '[A-Z][a-z][a-z] [A-Z][a-z][a-z] [ 0-9][0-9] [0-9:]* [A-Z0-9+-]* [0-9]*' && ok "normal send: last_send status *end, retcode 0, bytes and date as before" || ko "normal send last_send: $(C status | jv last_send)"
+
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"
+for o in -v --version; do C $o >/dev/null && [ "$(C $o)" = "$(C version)" ] && C $o | grep -qx 'apmond version [0-9][0-9.]*\(~be7a\)\{0,1\}' && ok "$o prints the version and exits 0, as mesh11sd" || ko "$o: $(C $o)"; done
+[ "$(C -v)" = "apmond version $(sed -n 's/^version="\(.*\)"$/\1/p' "$REPO/src/apmond")" ] && ok "-v reports the version= line of the script" || ko "-v vs version= ($(C -v))"
+INIT="$REPO/linux_openwrt/apmond/files/etc/init.d/apmond"
+[ "$(sed -n '/^service_data() {$/,/^}$/p' "$INIT")" = "$(printf 'service_data() {\n\t/usr/sbin/apmond -v\n}')" ] && eval "$(sed -n '/^service_data() {$/,/^}$/p' "$INIT" | sed 's|/usr/sbin/apmond|C|')" && [ "$(service_data)" = "$(C version)" ] && ok "init script service_data runs apmond -v, as mesh11sd" || ko "service_data"
 [ "$(C status | jv role)" = peer ] && [ "$(R status | jv role)" = router ] && ok "status shows role" || ko "status"
 R status | "$PY" -m json.tool >/dev/null && C status | "$PY" -m json.tool >/dev/null && ok "status output is valid JSON (python json.tool)" || ko "status not JSON"
 { [ -z "$JF" ] || [ "$(R status | jsonfilter -e '@.apmond_status.role')" = router ]; } && ok "status JSON readable with jsonfilter (if present)" || ko "jsonfilter status"
@@ -677,6 +715,38 @@ EOP
 [ "$B" = "$(snap)" ] && ok "get_ap_data sent nothing (collector data and last_send unchanged)" || ko "get_ap_data changed collector data / last_send"
 ! ls "$W"/run-C/entrynum.* >/dev/null 2>&1 && [ ! -e "$W/run-C/apmond/clients.loc" ] && ok "get_ap_data: per-pid log counter removed, no lock left" || ko "get_ap_data leftovers"
 C help | grep -q 'option: get_ap_data' && C help | grep -q 'Usage: apmond get_ap_data' && ok "get_ap_data in help" || ko "help get_ap_data"
+
+echo "== 15e. node_status carries the node's apmond ULA and IPv4 addresses, right after device_mac"
+# ns FILE MAC KEY: node_status.KEY of System@MAC as JSON
+ns() { "$PY" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["System@"+sys.argv[2]]["node_status"][sys.argv[3]]))' "$1" "$2" "$3"; }
+nskeys() { "$PY" -c 'import json,sys; print(" ".join(list(json.load(open(sys.argv[1]))["System@"+sys.argv[2]]["node_status"])[3:8]))' "$1" "$2"; }
+rm -f "$W/ip-C/addr4_apmbr0"
+C get_ap_data > "$W/na0.json" 2>/dev/null
+[ "$(nskeys "$W/na0.json" "$CMAC")" = "factory_mac device_mac node_ula ipv4_addresses uptime_seconds" ] && ok "node_status: node_ula and ipv4_addresses follow device_mac" || ko "node_status key order: $(nskeys "$W/na0.json" "$CMAC")"
+[ "$(ns "$W/na0.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && [ "$(C status | jv node_ula)" = "$CNULA" ] && ok "node_status node_ula $CNULA is the EUI-64 node ULA, the same as status node_ula" || ko "node_ula $(ns "$W/na0.json" "$CMAC" node_ula)"
+[ "$(ns "$W/na0.json" "$CMAC" ipv4_addresses)" = "[]" ] && ok "no IPv4 address on the device: ipv4_addresses []" || ko "ipv4 empty: $(ns "$W/na0.json" "$CMAC" ipv4_addresses)"
+printf '    inet 192.168.1.2/24 brd 192.168.1.255 scope global apmbr0\n    inet 10.10.0.2/16 scope global apmbr0\n    inet 192.168.1.2/24 scope global secondary apmbr0\n' > "$W/ip-C/addr4_apmbr0"
+sleep 1; C send >/dev/null 2>&1; rc=$?
+R show_ap_data "$CID" > "$W/na1.json"; R show_ap_data all > "$W/na-all.json"
+[ "$rc" -eq 0 ] && [ "$(ns "$W/na1.json" "$CMAC" ipv4_addresses)" = '["192.168.1.2/24", "10.10.0.2/16"]' ] && [ "$(ns "$W/na1.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && ok "collector shows the peer's node_ula and ipv4_addresses (a.b.c.d/len, each once)" || ko "collector node addresses: rc $rc $(ns "$W/na1.json" "$CMAC" ipv4_addresses)"
+json_ok < "$W/na-all.json" && { [ -z "$JQ2" ] || { "$JQ2" . "$W/na1.json" | cmp -s - "$W/na1.json"; }; } && ok "show_ap_data with the new fields: valid JSON, byte-identical to jq ." || ko "node addresses JSON vs jq"
+grep -q '"ipv4_addresses": \[$' "$W/na1.json" && grep -q '^        "10.10.0.2/16"$' "$W/na1.json" && ok "ipv4_addresses printed as json_array, one address per line" || ko "ipv4_addresses layout"
+# an older collector (apmond v1.0.0) accepts and shows the new report unchanged
+OLDA="$W/apmond-v1.0.0"
+if PATH="$SPATH" git -C "$REPO" show v1.0.0:src/apmond > "$OLDA" 2>/dev/null; then
+	cp "$W/www/cgi-bin/apmon.cgi.real" "$W/cgi.bak"
+	sed -i "s#busybox sh $REPO/src/apmond#busybox sh $OLDA#" "$W/www/cgi-bin/apmon.cgi.real"
+	sleep 1; C send >/dev/null 2>&1; rc=$?
+	MOCK_WAN_UP=1 MOCK_NODE=R MOCK_UCI_DIR="$W/uci-R" MOCK_IP_DIR="$W/ip-R" APMOND_TMPDIR="$W/run-R" APMOND_TMP_DATADIR="$W/tmp-R" busybox sh "$OLDA" show_ap_data "$CID" > "$W/na-old.json" 2>/dev/null
+	cp "$W/cgi.bak" "$W/www/cgi-bin/apmon.cgi.real"
+	[ "$rc" -eq 0 ] && json_ok < "$W/na-old.json" && [ "$(ns "$W/na-old.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && ! grep -q "protocol .* differs\|sent no apmond_protocol" "$W/tmp-R/apmond_log.log" 2>/dev/null && ok "apmond v1.0.0 collector accepts the report with the new fields (no protocol warning), shows them as sent" || ko "v1.0.0 collector: rc $rc"
+else
+	ok "apmond v1.0.0 collector check skipped (no git or no v1.0.0 tag)"
+fi
+# no ULA prefix or no device MAC: node_ula "unknown"
+sed -n '/^node_ula_addr() {/,/^}/p' "$REPO/src/apmond" > "$W/nula.sh"
+[ "$(busybox sh -c ". $W/nula.sh; ula_base=''; device_mac='02:00:00:0a:00:00'; node_ula_addr")" = unknown ] && [ "$(busybox sh -c ". $W/nula.sh; ula_base=fd00:1:2; ula_subnet=3; device_mac=unknown; node_ula_addr")" = unknown ] && ok "node_ula unknown without a ULA prefix or a device MAC" || ko "node_ula unknown"
+rm -f "$W/ip-C/addr4_apmbr0"
 
 echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
 ! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"
