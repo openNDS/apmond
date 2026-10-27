@@ -447,29 +447,112 @@ ipv6_canon() {
 	# Print an IPv6 address (optional /len) in the canonical RFC 5952 form the kernel and ip print:
 	# lower case, no leading zeros in a group, the longest run (2+) of zero groups as "::".
 	# Needed so addresses we generate (e.g. "...:5254:00ff:fe12:3401") match "ip -6 addr show" output.
+	#
+	# Example: "FD12:0034:0000:0000:0000:00ff:fe12:3401/64" -> "fd12:34::ff:fe12:3401/64"
 	echo "$1" | awk '{
-		addr = tolower($0); len = ""
-		if (index(addr, "/")) { len = substr(addr, index(addr, "/")); addr = substr(addr, 1, index(addr, "/") - 1) }
-		# expand to 8 groups
+		# Step 1: lower case everything, then split off any "/len" suffix to put back at the end
+		addr = tolower($0)
+		len = ""
+		slash = index(addr, "/")
+
+		if (slash) {
+			len = substr(addr, slash)
+			addr = substr(addr, 1, slash - 1)
+		}
+
+		# Step 2: split the address into the groups left and right of "::" (if there is one)
 		dc = index(addr, "::")
-		if (dc) { left = substr(addr, 1, dc - 1); right = substr(addr, dc + 2) } else { left = addr; right = "" }
-		nl = (left == "") ? 0 : split(left, L, ":"); nr = (right == "") ? 0 : split(right, R, ":")
-		out = 0
-		for (i = 1; i <= nl; i++) h[++out] = L[i]
-		if (dc) for (i = 0; i < 8 - nl - nr; i++) h[++out] = "0"
-		for (i = 1; i <= nr; i++) h[++out] = R[i]
-		for (i = 1; i <= 8; i++) { x = h[i]; sub(/^0+/, "", x); if (x == "") x = "0"; h[i] = x }
-		bs = 0; bl = 0; cs = 0; cl = 0
-		for (i = 1; i <= 8; i++) {
-			if (h[i] == "0") { if (cl == 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } } else cl = 0
+
+		if (dc) {
+			left = substr(addr, 1, dc - 1)
+			right = substr(addr, dc + 2)
+		} else {
+			left = addr
+			right = ""
 		}
-		r = ""
-		for (i = 1; i <= 8; i++) {
-			if (bl >= 2 && i == bs) { r = r "::"; i = bs + bl - 1; continue }
-			if (r != "" && substr(r, length(r)) != ":") r = r ":"
-			r = r h[i]
+
+		nleft = 0
+		nright = 0
+
+		if (left != "") {
+			nleft = split(left, L, ":")
 		}
-		print r len
+
+		if (right != "") {
+			nright = split(right, R, ":")
+		}
+
+		# Step 3: expand to the full 8 groups: left groups, then "::" filled with "0" groups, then right groups
+		n = 0
+
+		for (i = 1; i <= nleft; i++) {
+			group[++n] = L[i]
+		}
+
+		if (dc) {
+			for (i = 0; i < 8 - nleft - nright; i++) {
+				group[++n] = "0"
+			}
+		}
+
+		for (i = 1; i <= nright; i++) {
+			group[++n] = R[i]
+		}
+
+		# Step 4: strip leading zeros from each group ("00ff" -> "ff", "0000" -> "0")
+		for (i = 1; i <= 8; i++) {
+			g = group[i]
+			sub(/^0+/, "", g)
+
+			if (g == "") {
+				g = "0"
+			}
+
+			group[i] = g
+		}
+
+		# Step 5: find the longest run of "0" groups (the first one wins a tie)
+		best_start = 0
+		best_len = 0
+		run_start = 0
+		run_len = 0
+
+		for (i = 1; i <= 8; i++) {
+			if (group[i] == "0") {
+				if (run_len == 0) {
+					run_start = i
+				}
+
+				run_len++
+
+				if (run_len > best_len) {
+					best_len = run_len
+					best_start = run_start
+				}
+			} else {
+				run_len = 0
+			}
+		}
+
+		# Step 6: join the groups with ":", writing that run as "::" if it is 2 or more groups long
+		result = ""
+
+		for (i = 1; i <= 8; i++) {
+			if (best_len >= 2 && i == best_start) {
+				result = result "::"
+				# skip over the rest of the zero run
+				i = best_start + best_len - 1
+				continue
+			}
+
+			if (result != "" && substr(result, length(result)) != ":") {
+				result = result ":"
+			}
+
+			result = result group[i]
+		}
+
+		print result len
 	}'
 }
 
