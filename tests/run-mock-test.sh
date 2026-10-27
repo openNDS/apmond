@@ -288,7 +288,8 @@ sleep 1; C send && ok "report accepted again with the passphrase restored" || ko
 echo "== 5. large report, chunked"
 sleep 1
 MOCK_STATIONS=150 C send; rc=$?
-. "$W/run-C/last_send"
+# last_send is data, never sourced (see 5e): take last_bytes with sed
+last_bytes=$(sed -n 's/^last_bytes="\([0-9]*\)"$/\1/p' "$W/run-C/last_send")
 R show_ap_data "$CID" > "$W/big.json"
 n=$(grep -c '"02:00:00:00:' "$W/big.json")
 [ "$rc" -eq 0 ] && [ "$n" -eq 151 ] && json_ok < "$W/big.json" && ok "large report: $last_bytes hex chars in $(( (last_bytes + 2047) / 2048 )) chunks, 151 stations, valid JSON" || ko "large report rc=$rc stations=$n"
@@ -365,6 +366,39 @@ echo "apmond.setup.max_log_entries='5'" >> "$W/uci-R/apmond"
 for i in 1 2 3 4 5 6 7 8; do raw "apmond;t$i;$CMAC;begin;0;1;$(printf %064d 0);$(printf %064d 0)" "00" >/dev/null; done
 [ "$(wc -l < "$LF")" -le 6 ] && ok "max_log_entries: log truncated to the last N lines" || ko "truncation $(wc -l < "$LF")"
 cp "$W/r2.bak" "$W/uci-R/apmond"
+
+echo "== 5e. hostile collector reply: last_send is sanitised and never sourced"
+# Whatever answers at [<ula>::1]:443 chooses the reply; its first word is recorded as last_status.
+# A fake wget plays the rogue collector. Nothing may run, and status must stay valid JSON.
+mkdir -p "$W/hostile"
+cat > "$W/hostile/wget" <<'EOW'
+#!/bin/sh
+printf '%s' "$HOSTILE_REPLY"
+EOW
+chmod +x "$W/hostile/wget"
+ls_field() { "$PY" -c 'import json,sys; print(json.load(sys.stdin)["apmond_status"]["last_send"][sys.argv[1]])' "$1"; }
+for reply in 'x";touch '"$W"'/pwned;"' '$(touch '"$W"'/pwned)' '$(touch${IFS}'"$W"'/pwned)' '`touch${IFS}'"$W"'/pwned`' 'a"$(touch${IFS}'"$W"'/pwned)"b'; do
+	rm -f "$W/pwned"
+	HOSTILE_REPLY="$reply" PATH="$W/hostile:$PATH" C send >/dev/null 2>&1
+	C status > "$W/hostile.json" 2>/dev/null
+	want=$(printf '%s' "$reply" | awk 'NF {printf "%s", $1; exit}' | tr -cd '*A-Za-z0-9._-' | head -c 64)
+	got=$(ls_field status < "$W/hostile.json" 2>/dev/null)
+	[ ! -e "$W/pwned" ] && json_ok < "$W/hostile.json" && [ "$got" = "$want" ] && [ "$(ls_field retcode < "$W/hostile.json")" = 0 ] && ok "hostile reply [$reply]: nothing run, status valid JSON, last_send status [$got]" || ko "hostile reply [$reply]: pwned=$([ -e "$W/pwned" ] && echo yes || echo no) status [$got] want [$want]"
+done
+# a tampered last_send file is read as data too
+rm -f "$W/pwned"
+cp "$W/run-C/last_send" "$W/ls.bak"
+printf '%s\n' 'last_status="$(touch '"$W"'/pwned)"' 'last_send=x; touch '"$W"'/pwned' 'last_retcode=`touch '"$W"'/pwned`' 'last_bytes="12"' > "$W/run-C/last_send"
+C status > "$W/tampered.json" 2>/dev/null
+[ ! -e "$W/pwned" ] && json_ok < "$W/tampered.json" && [ "$(ls_field bytes < "$W/tampered.json")" = 12 ] && ok "tampered last_send file: nothing run, status valid JSON" || ko "tampered last_send file"
+# the ";" separated single line of apmond 1.0.0 still reads
+echo 'last_send="Tue Oct 27 15:52:00 GMT 2026"; last_status="*end"; last_retcode="0"; last_bytes="4096"' > "$W/run-C/last_send"
+[ "$(C status | jv last_send)" = '{"date_time": "Tue Oct 27 15:52:00 GMT 2026", "status": "*end", "retcode": "0", "bytes": "4096"}' ] && ok "1.0.0 format last_send read without sourcing" || ko "1.0.0 last_send: $(C status | jv last_send)"
+cp "$W/ls.bak" "$W/run-C/last_send"
+# a normal send shows exactly as before
+sleep 1; C send >/dev/null 2>&1; rc=$?
+C status > "$W/normal.json"
+[ "$rc" -eq 0 ] && [ "$(ls_field status < "$W/normal.json")" = "*end" ] && [ "$(ls_field retcode < "$W/normal.json")" = 0 ] && ls_field bytes < "$W/normal.json" | grep -qx '[0-9][0-9]*' && ls_field date_time < "$W/normal.json" | grep -qx '[A-Z][a-z][a-z] [A-Z][a-z][a-z] [ 0-9][0-9] [0-9:]* [A-Z0-9+-]* [0-9]*' && ok "normal send: last_send status *end, retcode 0, bytes and date as before" || ko "normal send last_send: $(C status | jv last_send)"
 
 echo "== 6. CLI and cleanup"
 C version | grep -q "apmond version" && ok "version" || ko "version"

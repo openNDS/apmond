@@ -2453,6 +2453,85 @@ server_url() {
 	echo "${APMOND_TEST_SCHEME:-https}://[$router_ula]:$port$cgi_path"
 }
 
+# last_send_clean <key> <value>: prints <value> keeping only the characters allowed for that last_send field.
+# last_status is the first word of the collector's reply, so it can be anything: never let a quote, $, ` or \ through.
+last_send_clean() {
+	case "$1" in
+		last_send)
+			# date output, e.g. "Tue Oct 27 15:52:00 GMT 2026"
+			printf '%s' "$2" | tr -cd 'A-Za-z0-9 :+._-'
+		;;
+
+		last_status)
+			# e.g. "*end", "*spider" or "nack", at most 64 characters
+			printf '%s' "$2" | tr -cd '*A-Za-z0-9._-' | head -c 64
+		;;
+
+		last_retcode|last_bytes)
+			printf '%s' "$2" | tr -cd '0-9'
+		;;
+	esac
+}
+
+# write_last_send <date> <status> <retcode> <bytes>: records the last send in $tmpdir/last_send, one key="value"
+# per line, every value cleaned by last_send_clean. show_status reads it back with read_last_send, never with "."
+write_last_send() {
+	local clean_date clean_status clean_retcode clean_bytes
+
+	clean_date=$(last_send_clean last_send "$1")
+	clean_status=$(last_send_clean last_status "$2")
+	clean_retcode=$(last_send_clean last_retcode "$3")
+	clean_bytes=$(last_send_clean last_bytes "$4")
+
+	{
+		printf 'last_send="%s"\n' "$clean_date"
+		printf 'last_status="%s"\n' "$clean_status"
+		printf 'last_retcode="%s"\n' "$clean_retcode"
+		printf 'last_bytes="%s"\n' "$clean_bytes"
+	} > "$tmpdir/last_send"
+}
+
+# read_last_send <file>: sets last_send, last_status, last_retcode and last_bytes from the file written by
+# write_last_send, without sourcing it: only these four keys are taken and each value is cleaned again,
+# so even an edited file cannot run anything. The single ";" separated line written by apmond 1.0.0 is read too.
+read_last_send() {
+	local content key value
+
+	last_send=""
+	last_status=""
+	last_retcode=""
+	last_bytes=""
+
+	# one key="value" per line (1.0.0: all on one line, separated by "; ")
+	content=$(tr ';' '\n' < "$1" | sed 's/^ *//')
+
+	while IFS='=' read -r key value; do
+		# drop the quotes around the value
+		value="${value#\"}"
+		value="${value%\"}"
+
+		case "$key" in
+			last_send)
+				last_send=$(last_send_clean last_send "$value")
+			;;
+
+			last_status)
+				last_status=$(last_send_clean last_status "$value")
+			;;
+
+			last_retcode)
+				last_retcode=$(last_send_clean last_retcode "$value")
+			;;
+
+			last_bytes)
+				last_bytes=$(last_send_clean last_bytes "$value")
+			;;
+		esac
+	done <<EOF
+$content
+EOF
+}
+
 send_request() {
 	# $1 user agent, $2 query string (hex chunk, may be empty)
 	local url="$apmon_url"
@@ -2573,11 +2652,10 @@ send_ap_data() {
 		log_warning "apmond - unable to reach server [ $apmon_url ], return code [ $retcode ] - $seed_hint"
 	fi
 
-	local last_send_date
+	local send_date
 
-	last_send_date=$(date)
-	printf 'last_send="%s"; last_status="%s"; last_retcode="%s"; last_bytes="%s"\n' \
-		"$last_send_date" "${send_status:-none}" "$retcode" "$hexencoded_len" > "$tmpdir/last_send"
+	send_date=$(date)
+	write_last_send "$send_date" "${send_status:-none}" "$retcode" "$hexencoded_len"
 
 	return "$retcode"
 }
@@ -3152,7 +3230,7 @@ show_status() {
 	fi
 
 	if [ -f "$tmpdir/last_send" ]; then
-		. "$tmpdir/last_send"
+		read_last_send "$tmpdir/last_send"
 		echo '    "last_send": {'
 		json_field "      " date_time "$last_send"
 		json_field "      " status "$last_status"

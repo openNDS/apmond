@@ -4,6 +4,7 @@ apmond (1.0.1~be7a)
   * Add - ipv6_canon() reformatted to be easier to read, no change in behaviour [bluewavenet]
   * Add - json_array() escapes each item on its own line, easier to read, no change in behaviour [bluewavenet]
   * Add - readability: one statement per line, multi-line if/for/case, json_field() helper for status JSON, no change in behaviour [bluewavenet]
+  * Fix - last_send status from the collector is sanitised and no longer sourced, so a rogue collector reply cannot run commands [bluewavenet]
 
  -- Rob White <dot@blue-wave.net>  Mon, 26 Oct 2026 22:24:23 +0000
 
