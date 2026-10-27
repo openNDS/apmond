@@ -2680,7 +2680,7 @@ json_str() {
 # json_array <indent> <items...>: prints a JSON array body the way jq . does: "[]" if empty, otherwise
 # "[", one element per line indented <indent>+2 spaces, and "]" at <indent> (caller prints key and trailing comma)
 json_array() {
-	local ind="$1" sep="" it
+	local ind="$1" sep="" it escaped
 	shift
 	if [ "$#" -eq 0 ]; then
 		printf '[]'
@@ -2688,7 +2688,9 @@ json_array() {
 	fi
 	printf '['
 	for it in "$@"; do
-		printf '%s\n%s  "%s"' "$sep" "$ind" "$(json_str "$it")"
+		# escape the item for JSON first, then print it on its own line, indented
+		escaped=$(json_str "$it")
+		printf '%s\n%s  "%s"' "$sep" "$ind" "$escaped"
 		sep=","
 	done
 	printf '\n%s]' "$ind"
