@@ -2421,6 +2421,9 @@ get_system_stats_json() {
 	echo "      \"apmond_checksum\": \"$checksum\","
 	echo "      \"factory_mac\": \"$factory_mac\","
 	echo "      \"device_mac\": \"$device_mac\","
+	# apmond: this node's apmond ULA and IPv4 addresses, so the collector can show and link to it.
+	# Extra node_status keys: older apmond and mesh11sd collectors store and show the report as they are.
+	node_status_addresses
 	echo "      \"uptime_seconds\": ${uptime_sec:-0},"
 	echo "      \"load_average_1min\": \"$load1\","
 	echo "      \"load_average_5min\": \"$load5\","
@@ -2430,6 +2433,55 @@ get_system_stats_json() {
 	echo "      \"cpu_temperature_c\": \"$cpu_temp\","
 	echo "      \"cpu_frequency_mhz\": \"$cpu_freq\""
 	echo "    },"
+}
+
+# node_ula_addr: this node's apmond ULA, the same address show_status prints as node_ula,
+# or "unknown" when there is no ULA prefix (no passphrase) or no device MAC
+node_ula_addr() {
+	local node_iid
+
+	if [ -z "$ula_base" ] || [ -z "$device_mac" ] || [ "$device_mac" = "unknown" ]; then
+		echo "unknown"
+		return 0
+	fi
+
+	node_iid=$(eui64_iid "$device_mac")
+	ipv6_canon "$ula_base:$ula_subnet:$node_iid"
+}
+
+# node_ipv4_addrs: every IPv4 address (a.b.c.d/len, as ip prints it) on option device and the configured
+# bridges, the interfaces show_status lists ula_addresses for, one per line, each address once
+node_ipv4_addrs() {
+	local ifaces="" i
+
+	for i in $id_device $bridge_list; do
+		# list each interface once
+		case " $ifaces " in
+			*" $i "*)
+			;;
+
+			*)
+				ifaces="$ifaces $i"
+			;;
+		esac
+	done
+
+	for i in $ifaces; do
+		ip -4 addr show dev "$i" 2>/dev/null | awk '$1 == "inet" {print $2}'
+	done | awk '!seen[$0]++'
+}
+
+# node_status_addresses: the node_ula and ipv4_addresses lines of node_status (6 space indent, both end with ",")
+node_status_addresses() {
+	local ula addrs
+
+	ula=$(node_ula_addr)
+	json_field "      " node_ula "$ula"
+
+	addrs=$(node_ipv4_addrs)
+	printf '      "ipv4_addresses": '
+	json_array "      " $addrs
+	echo ","
 }
 
 usi_full() {

@@ -716,6 +716,38 @@ EOP
 ! ls "$W"/run-C/entrynum.* >/dev/null 2>&1 && [ ! -e "$W/run-C/apmond/clients.loc" ] && ok "get_ap_data: per-pid log counter removed, no lock left" || ko "get_ap_data leftovers"
 C help | grep -q 'option: get_ap_data' && C help | grep -q 'Usage: apmond get_ap_data' && ok "get_ap_data in help" || ko "help get_ap_data"
 
+echo "== 15e. node_status carries the node's apmond ULA and IPv4 addresses, right after device_mac"
+# ns FILE MAC KEY: node_status.KEY of System@MAC as JSON
+ns() { "$PY" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["System@"+sys.argv[2]]["node_status"][sys.argv[3]]))' "$1" "$2" "$3"; }
+nskeys() { "$PY" -c 'import json,sys; print(" ".join(list(json.load(open(sys.argv[1]))["System@"+sys.argv[2]]["node_status"])[3:8]))' "$1" "$2"; }
+rm -f "$W/ip-C/addr4_apmbr0"
+C get_ap_data > "$W/na0.json" 2>/dev/null
+[ "$(nskeys "$W/na0.json" "$CMAC")" = "factory_mac device_mac node_ula ipv4_addresses uptime_seconds" ] && ok "node_status: node_ula and ipv4_addresses follow device_mac" || ko "node_status key order: $(nskeys "$W/na0.json" "$CMAC")"
+[ "$(ns "$W/na0.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && [ "$(C status | jv node_ula)" = "$CNULA" ] && ok "node_status node_ula $CNULA is the EUI-64 node ULA, the same as status node_ula" || ko "node_ula $(ns "$W/na0.json" "$CMAC" node_ula)"
+[ "$(ns "$W/na0.json" "$CMAC" ipv4_addresses)" = "[]" ] && ok "no IPv4 address on the device: ipv4_addresses []" || ko "ipv4 empty: $(ns "$W/na0.json" "$CMAC" ipv4_addresses)"
+printf '    inet 192.168.1.2/24 brd 192.168.1.255 scope global apmbr0\n    inet 10.10.0.2/16 scope global apmbr0\n    inet 192.168.1.2/24 scope global secondary apmbr0\n' > "$W/ip-C/addr4_apmbr0"
+sleep 1; C send >/dev/null 2>&1; rc=$?
+R show_ap_data "$CID" > "$W/na1.json"; R show_ap_data all > "$W/na-all.json"
+[ "$rc" -eq 0 ] && [ "$(ns "$W/na1.json" "$CMAC" ipv4_addresses)" = '["192.168.1.2/24", "10.10.0.2/16"]' ] && [ "$(ns "$W/na1.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && ok "collector shows the peer's node_ula and ipv4_addresses (a.b.c.d/len, each once)" || ko "collector node addresses: rc $rc $(ns "$W/na1.json" "$CMAC" ipv4_addresses)"
+json_ok < "$W/na-all.json" && { [ -z "$JQ2" ] || { "$JQ2" . "$W/na1.json" | cmp -s - "$W/na1.json"; }; } && ok "show_ap_data with the new fields: valid JSON, byte-identical to jq ." || ko "node addresses JSON vs jq"
+grep -q '"ipv4_addresses": \[$' "$W/na1.json" && grep -q '^        "10.10.0.2/16"$' "$W/na1.json" && ok "ipv4_addresses printed as json_array, one address per line" || ko "ipv4_addresses layout"
+# an older collector (apmond v1.0.0) accepts and shows the new report unchanged
+OLDA="$W/apmond-v1.0.0"
+if PATH="$SPATH" git -C "$REPO" show v1.0.0:src/apmond > "$OLDA" 2>/dev/null; then
+	cp "$W/www/cgi-bin/apmon.cgi.real" "$W/cgi.bak"
+	sed -i "s#busybox sh $REPO/src/apmond#busybox sh $OLDA#" "$W/www/cgi-bin/apmon.cgi.real"
+	sleep 1; C send >/dev/null 2>&1; rc=$?
+	MOCK_WAN_UP=1 MOCK_NODE=R MOCK_UCI_DIR="$W/uci-R" MOCK_IP_DIR="$W/ip-R" APMOND_TMPDIR="$W/run-R" APMOND_TMP_DATADIR="$W/tmp-R" busybox sh "$OLDA" show_ap_data "$CID" > "$W/na-old.json" 2>/dev/null
+	cp "$W/cgi.bak" "$W/www/cgi-bin/apmon.cgi.real"
+	[ "$rc" -eq 0 ] && json_ok < "$W/na-old.json" && [ "$(ns "$W/na-old.json" "$CMAC" node_ula)" = "\"$CNULA\"" ] && ! grep -q "protocol .* differs\|sent no apmond_protocol" "$W/tmp-R/apmond_log.log" 2>/dev/null && ok "apmond v1.0.0 collector accepts the report with the new fields (no protocol warning), shows them as sent" || ko "v1.0.0 collector: rc $rc"
+else
+	ok "apmond v1.0.0 collector check skipped (no git or no v1.0.0 tag)"
+fi
+# no ULA prefix or no device MAC: node_ula "unknown"
+sed -n '/^node_ula_addr() {/,/^}/p' "$REPO/src/apmond" > "$W/nula.sh"
+[ "$(busybox sh -c ". $W/nula.sh; ula_base=''; device_mac='02:00:00:0a:00:00'; node_ula_addr")" = unknown ] && [ "$(busybox sh -c ". $W/nula.sh; ula_base=fd00:1:2; ula_subnet=3; device_mac=unknown; node_ula_addr")" = unknown ] && ok "node_ula unknown without a ULA prefix or a device MAC" || ko "node_ula unknown"
+rm -f "$W/ip-C/addr4_apmbr0"
+
 echo "== 16. Race-safe /proc and file reads (no BusyBox \"can't open\" noise)"
 ! grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond" | grep -v '^\s*#' | grep -q . && ok "no redirect-read whose 2>/dev/null misses ash's can't open (reads use { ...; } 2>/dev/null)" || ko "unguarded reads: $(grep -nE '[^{] < "[^"]*" 2>/dev/null' "$REPO/src/apmond")"
 awk '/^daemon_pid\(\) \{/,/^}/' "$REPO/src/apmond" > "$W/dpid.sh"

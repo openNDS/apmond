@@ -10,6 +10,8 @@ key() { echo "$1" | tr ':/' '__'; }
 case "$1 $2 $3" in "-6 addr add"|"-6 addr del") op=$3; a=$(echo "$4" | sed -E 's/(^|:)0+([0-9a-f])/\1\2/g'); shift 4; set -- -6 addr "$op" "$a" "$@";; esac
 case "$*" in
 	"-6 addr show dev "*) cat "$D/addr_$5" 2>/dev/null; exit 0;;
+	# IPv4 addresses per simulated node: one "    inet a.b.c.d/len ..." line each in $D/addr4_<dev>
+	"-4 addr show dev "*) cat "$D/addr4_$5" 2>/dev/null; exit 0;;
 	"-6 addr add "*" dev "*) grep -q "inet6 $4 " "$D/addr_$6" 2>/dev/null && exit 2
 		k=$(key "$4"); flags=""
 		if [ -f "$N/$k" ] && [ "$(cat "$N/$k")" != "$me" ]; then flags=" dadfailed tentative"
