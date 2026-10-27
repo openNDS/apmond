@@ -18,7 +18,7 @@
 #
 
 last_version="1.0.0"
-version="1.0.1~be7a"
+version="1.0.1"
 protocol_version="1"
 
 # sha256 of the running script, computed once per invocation (as mesh11sd: checksum=$(sha256sum /usr/sbin/mesh11sd ...)).
