@@ -24,7 +24,7 @@ define Package/apmond
   CATEGORY:=Network
   TITLE:=Access Point Monitoring Daemon
   PKGARCH:=all
-  DEPENDS:=+luci-ssl
+  DEPENDS:=+uhttpd +px5g-mbedtls +libustream-mbedtls
   # opkg records CONFLICTS; OpenWrt's apk packaging ignores CONFLICTS, so express it as an apk "!" dependency
   CONFLICTS:=mesh11sd
   EXTRA_DEPENDS:=$(if $(CONFIG_USE_APK),!mesh11sd (>=0))
