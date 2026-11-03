@@ -1,6 +1,6 @@
 # apmon wire protocol, version 2
 
-Status: **draft for review** (2.0.0beta). This is the protocol spoken by apmond 2.x and libapmon.
+Status: **2.0.0 release**. This is the protocol spoken by apmond 2.x and libapmon.
 It is a clean design: it does not interoperate with apmond 1.x or with the script apmond built into mesh11sd.
 The apmond 2.x package does **not** conflict with mesh11sd: both can be installed on the same node. On a mesh11sd node, turn off mesh11sd's built-in apmond (`uci set mesh11sd.setup.apmond_enable='0'`) so only one monitoring system runs.
 

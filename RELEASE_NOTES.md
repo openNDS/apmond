@@ -1,8 +1,6 @@
-# apmond 2.0.0 — release notes (DRAFT)
+# apmond 2.0.0 — release notes
 
-> Draft for review. Based on openNDS/apmon branch `2.0.0beta` up to r36 (`8d996f9`), the repo README and
-> docs/PROTOCOL.md, the 1.x ChangeLog (openNDS/apmond 1.0.1), luci-app-apmond history up to 2.0.0_beta-r4
-> (`ddb39de`), and tests run on 2026-11-02. The release date is still a placeholder.
+Released Tue, 03 Nov 2026. Tag `v2.0.0` in [openNDS/apmond](https://github.com/openNDS/apmond).
 
 ## Overview
 

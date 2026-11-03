@@ -17,7 +17,7 @@ apmond (2.0.0)
   * Fix - a collector candidate never falls back to IPv4, it waits for its node ULA and keeps trying to claim [bluewavenet]
   * Add - mesh11sd (optional): no conflict with mesh11sd (set mesh11sd apmond_enable 0), node id chain shared with mesh11sd 8.0.0 [bluewavenet]
 
- -- Rob White <rob@blue-wave.net>  TODO-DATE
+ -- Rob White <rob@blue-wave.net>  Tue, 03 Nov 2026 13:04:11 +0000
 
 apmond (1.0.1)
   * Add - -v and --version options print the version, as mesh11sd [bluewavenet]

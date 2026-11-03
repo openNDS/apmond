@@ -7,8 +7,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apmond
-PKG_VERSION:=2.0.0_beta
-PKG_RELEASE:=36
+PKG_VERSION:=2.0.0
+PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/openNDS/apmond/tar.gz/v$(PKG_VERSION)?
