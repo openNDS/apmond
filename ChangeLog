@@ -1,3 +1,8 @@
+apmond (2.0.1beta)
+  * Change - version 2.0.1beta (PKG_VERSION 2.0.1_beta, PKG_RELEASE 1, APMOND_VERSION 2.0.1beta), development after the 2.0.0 release [bluewavenet]
+
+ -- Rob White <rob@blue-wave.net>  TODO-DATE
+
 apmond (2.0.0)
   * Add - rewrite in C: libapmon and the apmond daemon, wire protocol 2 (not compatible with 1.x, all access points must run 2.x) [bluewavenet]
   * Add - monitors several access points on one LAN however they are linked (cabled, mesh, point-to-point, fibre) [bluewavenet]

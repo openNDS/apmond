@@ -13,7 +13,7 @@
 
 #include "apmon.h"
 
-#define APMOND_VERSION "2.0.0"
+#define APMOND_VERSION "2.0.1beta"
 
 /* Baked in at build time (CMake -D, from the OpenWrt Makefile); see CMakeLists.txt */
 #ifndef APMOND_PACKAGE_VERSION
