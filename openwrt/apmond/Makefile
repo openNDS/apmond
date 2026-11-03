@@ -10,11 +10,11 @@ PKG_NAME:=apmond
 PKG_VERSION:=2.0.0_beta
 PKG_RELEASE:=36
 
-PKG_SOURCE:=apmon-$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://codeload.github.com/openNDS/apmon/tar.gz/v$(PKG_VERSION)?
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_URL:=https://codeload.github.com/openNDS/apmond/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=skip
 # One tree per variant, as package.mk does by default: the tarball unpacks into $(PKG_BUILD_DIR)/..
-PKG_BUILD_DIR:=$(BUILD_DIR)/apmon-$(BUILD_VARIANT)/apmon-$(PKG_VERSION)
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(BUILD_VARIANT)/$(PKG_NAME)-$(PKG_VERSION)
 
 PKG_MAINTAINER:=Rob White <rob@blue-wave.net>
 PKG_LICENSE:=GPL-2.0-only
@@ -27,7 +27,7 @@ define Package/apmond/default
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Access point monitoring daemon (protocol 2, C)
-  URL:=https://github.com/openNDS/apmon
+  URL:=https://github.com/openNDS/apmond
   USERID:=apmond=468:apmond=468
   DEPENDS:=+libubox +libubus +libuci +libblobmsg-json +libmicrohttpd-no-ssl
 endef
