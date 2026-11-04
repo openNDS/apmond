@@ -13,8 +13,6 @@ PKG_RELEASE:=1
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://codeload.github.com/openNDS/apmond/tar.gz/v$(PKG_VERSION)?
 PKG_HASH:=skip
-# One tree per variant, as package.mk does by default: the tarball unpacks into $(PKG_BUILD_DIR)/..
-PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)-$(BUILD_VARIANT)/$(PKG_NAME)-$(PKG_VERSION)
 
 PKG_MAINTAINER:=Rob White <rob@blue-wave.net>
 PKG_LICENSE:=GPL-2.0-only

@@ -65,8 +65,14 @@ jail_available() {
 
 start_service() {
 	local log_mountpoint
+	local enabled
 
 	config_load apmond
+	# option enabled '0': do not open an instance, or procd respawns the daemon until it is marked crashed
+	config_get_bool enabled setup enabled 1
+	if [ "$enabled" -ne 1 ]; then
+		return 0
+	fi
 	config_get log_mountpoint setup log_mountpoint /tmp
 	log_mountpoint="${log_mountpoint%/}"
 	if [ -z "$log_mountpoint" ]; then
