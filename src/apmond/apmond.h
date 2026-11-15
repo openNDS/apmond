@@ -24,6 +24,8 @@
 #endif
 #define APMOND_INSTALL_PATH "/usr/sbin/apmond"
 #define APMOND_CONFIG_PATH "/etc/config/apmond"
+#define APMOND_RUN_DIR "/tmp/apmond"
+#define APMOND_WIFIDETECT_FILE APMOND_RUN_DIR "/wifidetect"
 
 struct apmond_config {
 	int enabled;
@@ -132,6 +134,14 @@ int apmond_block_set(const char *name, struct blob_attr *data, int ttl);
 int apmond_block_remove(const char *name);
 void apmond_blocks_json(struct apmon_json *j);
 void apmond_blocks_list(struct blob_buf *b);
+
+/* wifidetect.c - Wi-Fi chipset/capability JSON, cached; not in reports */
+int apmond_wifidetect_refresh(void);
+const char *apmond_wifidetect_json(void);
+int apmond_wifidetect_write(const char *json);
+
+/* main.c: the WAN device from netifd, for the factory MAC chain ("" if none) */
+void apmond_wan_device(char *out, size_t len);
 
 /* cli.c */
 int apmond_cli(int argc, char **argv);

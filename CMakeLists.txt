@@ -31,6 +31,7 @@ add_library(apmon STATIC
 	src/lib/logfile.c
 	src/lib/factory_mac.c
 	src/lib/wifi_parse.c
+	src/lib/wifidetect.c
 )
 target_include_directories(apmon PUBLIC src/lib)
 set_property(TARGET apmon PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -88,6 +89,7 @@ if(BUILD_DAEMON)
 		src/apmond/cli.c
 		src/apmond/identity.c
 		src/apmond/privdrop.c
+		src/apmond/wifidetect.c
 	)
 	target_compile_definitions(apmond PRIVATE
 		APMOND_PACKAGE_VERSION="${APMOND_PACKAGE_VERSION}"

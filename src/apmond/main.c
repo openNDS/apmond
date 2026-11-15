@@ -81,7 +81,7 @@ static void resolve_netdev(void)
  * Not libuci: /etc/config/network is root only (0600) and apmond runs as user apmond.
  * No WAN interface (a dumb AP) or no ubus: empty, and the chain skips that step.
  */
-static void wan_device(char *out, size_t len)
+void apmond_wan_device(char *out, size_t len)
 {
 	enum {
 		WAN_DEVICE,
@@ -127,7 +127,7 @@ static int read_node_id(void)
 	char wan[64];
 	char source[96];
 
-	wan_device(wan, sizeof(wan));
+	apmond_wan_device(wan, sizeof(wan));
 	if (apmon_factory_mac("", wan, apmond.id, source, sizeof(source)) != 0) {
 		LOG_ERR_("cannot determine the factory MAC address (no label MAC, no universally administered permanent ethernet MAC)");
 		return -1;
@@ -185,6 +185,7 @@ static int run_daemon(const char *confdir)
 	ubus_add_uloop(apmond.ubus);
 	apmond_ubus_init();
 	resolve_netdev();
+	apmond_wifidetect_refresh();
 
 	if (apmond.cfg.default_seed) {
 		seed_warn_timer.cb = warn_default_seed;

@@ -377,3 +377,10 @@ const char *apmon_iftype_name(int iftype);
 int apmon_wifi_radio_key(uint32_t radio_mask, int freq);
 int apmon_wifi_radio_index(int key);
 const char *apmon_band_name(int freq);
+
+/*
+ * wifidetect.c: this node's Wi-Fi capabilities per phy as mesh11sd v7 wifi_chipset_detect
+ * JSON ("System@<labelmac>" with the release, device and "phy" objects). labelmac is the
+ * factory MAC as text. Returns a malloc'd string (free it), NULL if out of memory.
+ */
+char *apmon_wifidetect(const char *labelmac);

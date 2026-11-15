@@ -10,7 +10,7 @@ Status: **2.0.1beta, development build after the 2.0.0 release.** Protocol: [doc
 
 | Path | What |
 |---|---|
-| `src/lib` | libapmon: PBKDF2/HKDF key derivation, AES-256-GCM envelope, replay cache, JSON writer; crypto through `crypto.h` with an mbedtls or OpenSSL 3 backend (`-DCRYPTO_BACKEND=mbedtls\|openssl`) |
+| `src/lib` | libapmon: PBKDF2/HKDF key derivation, AES-256-GCM envelope, replay cache, JSON writer, Wi-Fi chipset detection; crypto through `crypto.h` with an mbedtls or OpenSSL 3 backend (`-DCRYPTO_BACKEND=mbedtls\|openssl`) |
 | `src/apmond` | the daemon: uloop, uci, ubus, data collection, sender, collector (libmicrohttpd) |
 | `tests` | host unit tests (`make -C tests check`, `CRYPTO=openssl` for the OpenSSL backend, `check-all` for both; add `MBEDTLS_DIR=<mbedtls 3.6 tree>` if the system has no mbedtls) and test vectors |
 | `openwrt/apmond` | OpenWrt package (Makefile, `files/apmond.config`, `files/apmond.init`) |
@@ -47,6 +47,7 @@ mesh11sd is optional. apmond 2.x does not conflict with mesh11sd. On mesh11sd no
     apmond block add <name> <json> [ttl]
     apmond block remove <name>
     apmond debuglevel [0|1|2|3]          show, or set at once and save to uci
+    apmond wifidetect                    this node's Wi-Fi chipsets and capabilities, detected again (see below)
     apmond read_log [-f]                 print the log; -f keeps following it
     apmond bench                         key derivation time on this hardware
     apmond run [-c confdir]              the daemon itself (started by /etc/init.d/apmond)
@@ -113,6 +114,22 @@ Any program on a node can attach a JSON object to that node's reports:
 
 The collector shows it in `apmond node <node_mac>` under `blocks.mesh` (and in `apmond nodes`). Names: 1–32 of `a-z 0-9 _ -`; data up to 16 KiB; up to 16 blocks; RAM only; `ttl` (seconds) makes a block expire unless it is set again. This is how a rewritten mesh11sd can add its mesh data without its own reporting code. See docs/PROTOCOL.md section 9.
 
+## Wi-Fi chipset detection (wifidetect)
+
+`apmond wifidetect` (or `ubus call apmond wifidetect '{"refresh":true}'`) prints this node's
+Wi-Fi chipsets and capabilities as JSON, with the key names and layout of mesh11sd v7
+`wifi_chipset_detect`: `System@<factory MAC>` holds Distribution, Release, Revision, Target,
+Architecture, Description and Device, and `phy` holds one object per phy with Chipset, Bands,
+Standards, MeshPoint, Wi-FiGeneration, MIMO, MaxChannelWidth, ChannelWidthCap, Antennas,
+TheoreticalMaxMbps (Aggregated_MLO_MaxMbps for Wi-Fi 7), TXQS, AIRTIME_FAIRNESS, AQL_Extended,
+AQL_Runtime and Driver. The daemon detects once at startup and again only on request, keeps the
+result in RAM (`ubus call apmond wifidetect` without `refresh` returns it) and writes it to
+`/tmp/apmond/wifidetect`. It is not sent in reports. The data comes from `/sys/class/ieee80211`,
+`/etc/openwrt_release`, `/etc/board.json` and `iw phy <phy> info` (`iw` is not a dependency:
+without it Bands, Standards and the rest read unknown or false). AQL_Runtime needs debugfs, which
+only root can read, so the daemon reports it false; if apmond is not running, `apmond wifidetect`
+detects by itself as root.
+
 ## Which code is running
 
 Every node reports, right after `apmond_version`, `package_version` (eg 2.0.0_beta-r13),
@@ -137,7 +154,7 @@ the init script starts it one of two ways:
   (`/etc/capabilities/apmond.json`), no_new_privs, and these mounts: ubus, log, /proc,
   /sys, read-only `/etc/config`, `/etc/openwrt_release`, `/tmp/sysinfo`, `/usr/sbin` (so
   `installed_sha256` sees a replaced binary), `/overlay` (free flash), `/bin/sh` and
-  `/sbin/swconfig` (wired speed fallback), and read-write `/tmp/apmond` plus
+  `/sbin/swconfig` (wired speed fallback), `/usr/sbin/iw` when installed (wifidetect), and read-write `/tmp/apmond` plus
   `log_mountpoint` when it is not /tmp.
 - **otherwise** (no ujail, or a small target such as ramips/mt76x8 whose kernel has only
   mount namespaces, where ujail cannot start): `apmond run -u apmond` starts as root and

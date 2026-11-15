@@ -32,6 +32,8 @@ static void usage(void)
 	       "  block remove <name>                  remove it again\n"
 	       "  debuglevel [0|1|2|3]                 show, or set now and save to uci (0 errors, 1 notice,\n"
 	       "                                       2 info, 3 debug)\n"
+	       "  wifidetect                           detect this node's Wi-Fi chipsets and capabilities again\n"
+	       "                                       (also in /tmp/apmond/wifidetect)\n"
 	       "  read_log [-f]                        print the apmond log; -f keeps following it\n"
 	       "  bench                                time the key derivation on this hardware\n"
 	       "  run [-c confdir] [-u user]           run the daemon (used by /etc/init.d/apmond)\n"
@@ -853,6 +855,56 @@ static int simple_call(const char *method, struct blob_attr *args)
 	return 0;
 }
 
+/*
+ * wifidetect: ask the daemon to detect again and print its JSON. When apmond is not
+ * running, detect here instead (as root, so AQL_Runtime can be seen) and write the file.
+ */
+static int cmd_wifidetect(void)
+{
+	struct blob_buf b;
+	struct blob_attr *msg;
+	char wan[64];
+	uint8_t mac[APMON_ID_LEN];
+	char source[96];
+	char *json;
+	int ret;
+
+	memset(&b, 0, sizeof(b));
+	blob_buf_init(&b, 0);
+	blobmsg_add_u8(&b, "refresh", 1);
+	ret = call("wifidetect", b.head, &msg);
+	blob_buf_free(&b);
+	if (ret == 0) {
+		print_json(msg);
+		free(msg);
+		return 0;
+	}
+	free(msg);
+	if (ret != UBUS_STATUS_NOT_FOUND && ret != UBUS_STATUS_CONNECTION_FAILED) {
+		fprintf(stderr, "wifidetect failed: %s\n", ubus_strerror(ret));
+		return 1;
+	}
+
+	fprintf(stderr, "detecting without the daemon\n");
+	apmond_wan_device(wan, sizeof(wan));
+	if (apmon_factory_mac("", wan, mac, source, sizeof(source)) != 0) {
+		fprintf(stderr, "cannot determine the factory MAC address\n");
+		return 1;
+	}
+	apmon_mac_format(mac, apmond.id_str);
+	json = apmon_wifidetect(apmond.id_str);
+	if (json == NULL) {
+		fprintf(stderr, "wifidetect: out of memory\n");
+		return 1;
+	}
+	if (apmond_wifidetect_write(json) != 0) {
+		fprintf(stderr, "cannot write %s\n", APMOND_WIFIDETECT_FILE);
+	}
+	fputs(json, stdout);
+	free(json);
+	return 0;
+}
+
 static int cmd_block(int argc, char **argv)
 {
 	struct blob_buf b;
@@ -1223,6 +1275,9 @@ int apmond_cli(int argc, char **argv)
 	}
 	if (strcmp(args[0], "debuglevel") == 0 && n <= 2) {
 		return cmd_debuglevel(n - 1, args + 1);
+	}
+	if (strcmp(args[0], "wifidetect") == 0 && n == 1) {
+		return cmd_wifidetect();
 	}
 	if (strcmp(args[0], "read_log") == 0 && n <= 2) {
 		int follow = 0;

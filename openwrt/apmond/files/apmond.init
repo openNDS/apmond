@@ -121,6 +121,10 @@ start_service() {
 		procd_add_jail_mount /usr/sbin
 		# wired speed fallback: popen("swconfig ...") needs a shell
 		procd_add_jail_mount /bin/sh /sbin/swconfig
+		# wifidetect runs "iw phy <phy> info": a file mount brings its libraries (libnl-tiny) too
+		if [ -x /usr/sbin/iw ]; then
+			procd_add_jail_mount /usr/sbin/iw
+		fi
 		# node id: the device tree copy is in /tmp/apmond (above), then board.json label_macaddr
 		if [ -f /etc/board.json ]; then
 			procd_add_jail_mount /etc/board.json

@@ -237,6 +237,7 @@ ubus object **`apmond`** (used by luci-app-apmond and the `apmond` CLI, which be
 | `add_block` | `name`, `data` (object), `ttl` (s, optional) | any node: attach or replace an extension block in this node's reports |
 | `remove_block` | `name` | any node: remove it |
 | `debuglevel` | `level` (0–3)? | without `level`: `{"debuglevel": N}`. With it: applies at once and tries to commit `option debuglevel` to /etc/config/apmond (as 1.x); returns `{"debuglevel": N, "persisted": true|false}`. The daemon runs as user apmond and cannot write /etc/config, so it is normally `false`; `apmond debuglevel N` (root) then commits it itself. The daemon re-reads the uci option every report cycle and applies it when the uci value changes, so `uci set apmond.setup.debuglevel=N; uci commit apmond` works too while the file is readable by group apmond (see README, Security) |
+| `wifidetect` | `refresh` (bool)? | any node: this node's Wi-Fi chipsets and capabilities as mesh11sd v7 `wifi_chipset_detect` JSON (`{"System@<factory MAC>": {..., "phy": {...}}}`, see README). Detected at startup and cached; `refresh: true` detects again first. Also written to `/tmp/apmond/wifidetect`. Not part of the REPORT |
 | `forget` | `node_mac` (or `node`) or `client_mac` (or `client`) | collector: drop a node with its clients, or one client (a node that still reports comes back) |
 
 `status` on every node also returns `role_reason`, `node_ula`, `collector_ula`, `collector_via` (sender: `ula`, `ipv4` or `config`) and the local `blocks` (name, size, seconds to expiry).

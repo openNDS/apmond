@@ -1581,6 +1581,38 @@ static int ubus_debuglevel(struct ubus_context *ctx, struct ubus_object *obj, st
 	return 0;
 }
 
+enum {
+	WIFIDETECT_REFRESH,
+	__WIFIDETECT_MAX,
+};
+
+static const struct blobmsg_policy wifidetect_policy[__WIFIDETECT_MAX] = {
+	[WIFIDETECT_REFRESH] = { .name = "refresh", .type = BLOBMSG_TYPE_BOOL },
+};
+
+/* wifidetect {}: the cached Wi-Fi chipset/capability JSON; wifidetect {"refresh": true}: detect again first */
+static int ubus_wifidetect(struct ubus_context *ctx, struct ubus_object *obj, struct ubus_request_data *req,
+			   const char *method, struct blob_attr *msg)
+{
+	struct blob_attr *tb[__WIFIDETECT_MAX];
+	const char *json;
+
+	(void)obj;
+	(void)method;
+
+	blobmsg_parse(wifidetect_policy, __WIFIDETECT_MAX, tb, blob_data(msg), blob_len(msg));
+	if (tb[WIFIDETECT_REFRESH] != NULL && blobmsg_get_bool(tb[WIFIDETECT_REFRESH])) {
+		apmond_wifidetect_refresh();
+	}
+	json = apmond_wifidetect_json();
+	blob_buf_init(&bb, 0);
+	if (json == NULL || !blobmsg_add_json_from_string(&bb, json)) {
+		return UBUS_STATUS_UNKNOWN_ERROR;
+	}
+	ubus_send_reply(ctx, req, bb.head);
+	return 0;
+}
+
 static const struct ubus_method apmond_methods[] = {
 	UBUS_METHOD_NOARG("status", ubus_status),
 	UBUS_METHOD_NOARG("nodes", ubus_nodes),
@@ -1590,6 +1622,7 @@ static const struct ubus_method apmond_methods[] = {
 	UBUS_METHOD("remove_block", ubus_remove_block, remove_block_policy),
 	UBUS_METHOD("forget", ubus_forget, forget_policy),
 	UBUS_METHOD("debuglevel", ubus_debuglevel, debuglevel_policy),
+	UBUS_METHOD("wifidetect", ubus_wifidetect, wifidetect_policy),
 };
 
 static struct ubus_object_type apmond_object_type = UBUS_OBJECT_TYPE("apmond", apmond_methods);
