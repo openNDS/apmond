@@ -45,6 +45,8 @@ static int bench(void)
  * The layer 3 device we work on (ULA addresses, listener, uplink test).
  * option netdev wins, else the l3_device of option interface (default lan),
  * else option device. On a VLAN setup this is eg br-lan.10, not br-lan.
+ * With neither option set, a sender later follows its uplink (ula.c apmond_ula_follow_uplink);
+ * lan_netdev keeps this device for the collector and as the fallback.
  */
 static void resolve_netdev(void)
 {
@@ -55,10 +57,12 @@ static void resolve_netdev(void)
 
 	if (apmond.cfg.netdev[0] != '\0') {
 		LOG_INFO_("network device [ %s ] from option netdev", apmond.cfg.netdev);
+		snprintf(apmond.lan_netdev, sizeof(apmond.lan_netdev), "%s", apmond.cfg.netdev);
 		return;
 	}
 	snprintf(apmond.cfg.netdev, sizeof(apmond.cfg.netdev), "%s", apmond.cfg.device);
 	snprintf(object, sizeof(object), "network.interface.%s", apmond.cfg.interface);
+	snprintf(apmond.lan_netdev, sizeof(apmond.lan_netdev), "%s", apmond.cfg.netdev);
 	if (apmond_ubus_call(apmond.ubus, object, "status", NULL, &out) != 0) {
 		LOG_NOTICE_("interface [ %s ] not found, using device [ %s ]", apmond.cfg.interface, apmond.cfg.netdev);
 		return;
@@ -73,6 +77,7 @@ static void resolve_netdev(void)
 		snprintf(apmond.cfg.netdev, sizeof(apmond.cfg.netdev), "%s", blobmsg_get_string(cur));
 	}
 	free(out);
+	snprintf(apmond.lan_netdev, sizeof(apmond.lan_netdev), "%s", apmond.cfg.netdev);
 	LOG_NOTICE_("interface [ %s ] is on network device [ %s ]", apmond.cfg.interface, apmond.cfg.netdev);
 }
 

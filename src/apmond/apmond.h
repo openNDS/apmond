@@ -37,6 +37,7 @@ struct apmond_config {
 	char device[32];
 	char interface[32];
 	char netdev[32];
+	int netdev_auto;           /* neither option netdev nor option interface set: follow the uplink */
 	char seed[256];
 	int default_seed;
 	uint32_t key_epoch;
@@ -70,6 +71,7 @@ struct apmond {
 	char collector_via[8];          /* "ula", "ipv4" or "config" */
 	int ipv4_fallback;
 	char node_ula[46];
+	char lan_netdev[32];            /* netdev from option interface/device, before any uplink choice */
 	char router_ula[46];
 	char role_reason[160];
 	struct ubus_context *ubus;
@@ -113,6 +115,7 @@ int apmond_ula_holding_router(void);
 void apmond_ula_give_up_router(void);
 void apmond_ula_set_listen_ok(int ok);
 int apmond_ula_node_ready(void);
+void apmond_ula_follow_uplink(int candidate);
 
 /* vlan.c */
 /* nl80211.c */

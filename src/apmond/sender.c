@@ -296,6 +296,7 @@ static void decide_role(void)
 
 	candidate = collector_candidate();
 	portal_candidate = candidate;
+	apmond_ula_follow_uplink(candidate);
 
 	/* r16 re-bind failed while holding ::1: same as a failed start */
 	if (apmond_collector_rebind_failed()) {

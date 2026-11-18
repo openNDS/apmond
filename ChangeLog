@@ -1,6 +1,7 @@
 apmond (2.0.1beta)
   * Change - version 2.0.1beta (PKG_VERSION 2.0.1_beta, PKG_RELEASE 1, APMOND_VERSION 2.0.1beta), development after the 2.0.0 release [bluewavenet]
   * Add - wifidetect: Wi-Fi chipset and capability detection as mesh11sd v7 wifi_chipset_detect JSON, apmond wifidetect and ubus wifidetect, cached and written to /tmp/apmond/wifidetect, not in reports [bluewavenet]
+  * Fix - with neither option netdev nor option interface set, a sender puts its node ULA on, and reports ipv4_addresses from, the device that reaches the collector (ULA prefix on-link, else IPv4 default route, else lan), re-checked every interval; a node whose uplink network is bridged into its WAN, such as a CPE, was reporting unreachable lan addresses. PKG_RELEASE 2 [bluewavenet]
 
  -- Rob White <rob@blue-wave.net>  TODO-DATE
 

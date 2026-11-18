@@ -9,6 +9,9 @@
  *     backed off and ::1 silent for router_takeover_misses checks -> take over
  *     first claim after a random 0..claim_delay_max s delay, then wait for DAD
  * - addresses are added and removed with rtnetlink (no ip command); all are removed on stop
+ * - with neither option netdev nor option interface set, a sender puts its node ULA on the device
+ *   that reaches the collector (apmond_ula_follow_uplink), eg br-wan on a node whose uplink
+ *   network is bridged into its WAN, such as a CPE
  * SPDX-License-Identifier: GPL-2.0-only
  */
 #include <arpa/inet.h>
@@ -480,6 +483,140 @@ int apmond_ula_node_ready(void)
 	}
 	flags = addr_flags(&node_addr);
 	return flags >= 0 && (flags & (IFA_DADFAILED | IFA_TENTATIVE)) == 0;
+}
+
+/* ---------- which device a sender uses (option netdev / interface not set) ---------- */
+
+/*
+ * The device on which <prefix>::/64 is on-link, from an rtnetlink route dump: a unicast route
+ * without a gateway that netifd, an RA or the admin added. Routes the kernel adds for our own
+ * addresses (proto kernel) are skipped, as are unreachable routes (eg on lo) and the local table.
+ * The current netdev wins if it is one of several. Returns 0 and the name, else -1.
+ */
+static int prefix_route_dev(char *out, size_t len)
+{
+	struct {
+		struct nlmsghdr nh;
+		struct rtmsg rt;
+	} req;
+	struct sockaddr_nl sa;
+	char buf[8192];
+	int fd;
+	int found = -1;
+	int done = 0;
+
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (fd < 0) {
+		return -1;
+	}
+	memset(&req, 0, sizeof(req));
+	req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	req.nh.nlmsg_type = RTM_GETROUTE;
+	req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.rt.rtm_family = AF_INET6;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	if (sendto(fd, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	while (!done) {
+		struct nlmsghdr *nh;
+		ssize_t got = recv(fd, buf, sizeof(buf), 0);
+		int left;
+
+		if (got <= 0) {
+			break;
+		}
+		left = (int)got;
+		for (nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, left); nh = NLMSG_NEXT(nh, left)) {
+			struct rtmsg *rt = NLMSG_DATA(nh);
+			struct rtattr *rta;
+			int rlen;
+			int oif = 0;
+			int gateway = 0;
+			int match = 0;
+			char name[IF_NAMESIZE];
+
+			if (nh->nlmsg_type == NLMSG_DONE || nh->nlmsg_type == NLMSG_ERROR) {
+				done = 1;
+				break;
+			}
+			if (nh->nlmsg_type != RTM_NEWROUTE || rt->rtm_type != RTN_UNICAST || rt->rtm_dst_len != 64 ||
+			    rt->rtm_protocol == RTPROT_KERNEL || rt->rtm_table == RT_TABLE_LOCAL) {
+				continue;
+			}
+			rlen = (int)RTM_PAYLOAD(nh);
+			for (rta = RTM_RTA(rt); RTA_OK(rta, rlen); rta = RTA_NEXT(rta, rlen)) {
+				if (rta->rta_type == RTA_DST && RTA_PAYLOAD(rta) == 16) {
+					match = memcmp(RTA_DATA(rta), router_addr.s6_addr, 8) == 0;
+				} else if (rta->rta_type == RTA_OIF) {
+					oif = *(int *)RTA_DATA(rta);
+				} else if (rta->rta_type == RTA_GATEWAY) {
+					gateway = 1;
+				}
+			}
+			if (!match || gateway || oif == 0 || if_indextoname((unsigned int)oif, name) == NULL ||
+			    strcmp(name, "lo") == 0) {
+				continue;
+			}
+			if (found != 0 || strcmp(name, apmond.cfg.netdev) == 0) {
+				snprintf(out, len, "%s", name);
+				found = 0;
+			}
+		}
+	}
+	close(fd);
+	return found;
+}
+
+/*
+ * Option netdev and option interface not set: a sender uses the device that reaches the
+ * collector, so its node ULA and reported addresses are reachable from there:
+ *   1. the device on which the apmond ULA prefix is on-link (prefix_route_dev)
+ *   2. else the device of the IPv4 default route
+ *   3. else the lan device (lan_netdev), as before
+ * A collector candidate always uses the lan device. Called every interval, so a WAN that comes
+ * up later is picked up; on a change the node ULA (and ::1, if held) moves to the new device.
+ */
+void apmond_ula_follow_uplink(int candidate)
+{
+	char dev[sizeof(apmond.cfg.netdev)] = "";
+	char gateway[64];
+	const char *how = "lan";
+	int old;
+
+	if (!apmond.cfg.netdev_auto || apmond.lan_netdev[0] == '\0') {
+		return;
+	}
+	if (candidate) {
+		snprintf(dev, sizeof(dev), "%s", apmond.lan_netdev);
+	} else if (have_prefix && prefix_route_dev(dev, sizeof(dev)) == 0) {
+		how = "ULA prefix route";
+	} else if (apmond_default_route(dev, sizeof(dev), gateway, sizeof(gateway)) == 0) {
+		how = "IPv4 default route";
+	} else {
+		snprintf(dev, sizeof(dev), "%s", apmond.lan_netdev);
+	}
+	if (dev[0] == '\0' || if_nametoindex(dev) == 0 || strcmp(dev, apmond.cfg.netdev) == 0) {
+		return;
+	}
+
+	old = (int)if_nametoindex(apmond.cfg.netdev);
+	if (have_prefix && old != 0) {
+		if (addr_flags(&router_addr) >= 0) {
+			addr_change(0, &router_addr, old);
+		}
+		if (addr_flags(&node_addr) >= 0) {
+			addr_change(0, &node_addr, old);
+		}
+	}
+	added_router = 0;
+	added_node = 0;
+	LOG_NOTICE_("network device [ %s ] -> [ %s ] (%s), node ULA %s moves with it", apmond.cfg.netdev, dev, how,
+		    apmond.node_ula);
+	snprintf(apmond.cfg.netdev, sizeof(apmond.cfg.netdev), "%s", dev);
 }
 
 void apmond_ula_cleanup(void)
