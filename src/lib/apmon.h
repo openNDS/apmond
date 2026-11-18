@@ -137,8 +137,13 @@ enum apmon_collector_pick {
 };
 enum apmon_collector_pick apmon_collector_pick(int have_ula, int ula_ready, int ipv4_fallback,
 					       uint64_t waited_ms, int portal, int have_lan_gateway);
-/* After a failed send: the new ipv4_fallback. Only a failed ULA send of a non-portal moves to IPv4. */
-int apmon_fallback_after_failure(int failed_was_ula, int portal);
+/*
+ * After a failed send: the new ipv4_fallback. Only ULA sends of a non-portal move to IPv4, and
+ * only after APMON_ULA_FAILS_BEFORE_IPV4 of them in a row (ula_failures counts this one), so a
+ * single miss such as a collector restart does not leave the ULA.
+ */
+#define APMON_ULA_FAILS_BEFORE_IPV4 2
+int apmon_fallback_after_failure(int failed_was_ula, int ula_failures, int portal);
 void apmon_sender_summary(uint64_t sent, uint64_t failed, uint64_t time_sync_failed, uint32_t last_status,
 			  const char *last_error, char *out, size_t len);
 /*

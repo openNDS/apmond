@@ -160,6 +160,9 @@ static uint64_t ula_wait_start_ms;
 /* r34: set by decide_role: this node has an upstream on its WAN (a portal candidate) */
 static int portal_candidate;
 
+/* failed ULA sends in a row; reset by any send that reaches the collector */
+static int ula_send_failures;
+
 /* r34: the lan side IPv4 gateway only, never the WAN default route */
 static void use_ipv4_gateway(const char *lan_gateway)
 {
@@ -394,12 +397,26 @@ static int exchange(uint8_t type, const char *plaintext, char **reply)
 		status = apmond_collector_process(type == APMON_TYPE_TIME_REQ, msg, msg_len, "local", &resp, &resp_len);
 	} else if (apmond_http_post(apmond.collector_addr, apmond.cfg.port, path, msg, msg_len, HTTP_TIMEOUT_S,
 				    &status, &resp, &resp_len) != 0) {
+		int failed_was_ula = strcmp(apmond.collector_via, "ula") == 0;
+
 		LOG_INFO_("collector %s port %d not reachable", apmond.collector_addr, apmond.cfg.port);
 		status = 0;
-		/* r32: only a failed ULA send moves to IPv4; a failed IPv4 send goes back to the ULA */
-		/* r34: never for a portal candidate */
-		apmond.ipv4_fallback = apmon_fallback_after_failure(strcmp(apmond.collector_via, "ula") == 0,
+		/* r32: only failed ULA sends move to IPv4; a failed IPv4 send goes back to the ULA */
+		/* r34: never for a portal candidate. 2.0.1beta: two failed ULA sends in a row */
+		if (failed_was_ula) {
+			ula_send_failures++;
+		} else {
+			ula_send_failures = 0;
+		}
+		apmond.ipv4_fallback = apmon_fallback_after_failure(failed_was_ula, ula_send_failures,
 								    portal_candidate);
+		if (apmond.ipv4_fallback) {
+			LOG_NOTICE_("collector ULA not reachable %d times in a row, using the lan IPv4 gateway",
+				    ula_send_failures);
+			ula_send_failures = 0;
+		}
+	} else {
+		ula_send_failures = 0;
 	}
 	free(msg);
 

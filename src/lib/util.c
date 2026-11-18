@@ -182,13 +182,14 @@ enum apmon_collector_pick apmon_collector_pick(int have_ula, int ula_ready, int 
  * r32: a failed ULA send falls back to IPv4. A failed IPv4 send (in fallback, or because
  * the ULA was not ready in time) goes back to the ULA, never forcing a second IPv4 try.
  * r34: a portal candidate never falls back to IPv4.
+ * 2.0.1beta: the fallback needs APMON_ULA_FAILS_BEFORE_IPV4 failed ULA sends in a row.
  */
-int apmon_fallback_after_failure(int failed_was_ula, int portal)
+int apmon_fallback_after_failure(int failed_was_ula, int ula_failures, int portal)
 {
 	if (portal) {
 		return 0;
 	}
-	if (failed_was_ula) {
+	if (failed_was_ula && ula_failures >= APMON_ULA_FAILS_BEFORE_IPV4) {
 		return 1;
 	}
 	return 0;

@@ -991,10 +991,11 @@ static void test_collector_pick(void)
 	/* r35: a portal with no collector ULA at all (ULA setup failed) uses the lan gateway */
 	CHECK(apmon_collector_pick(0, 0, 0, 0, 1, 1) == APMON_PICK_IPV4,
 	      "collector pick: portal without collector ULA uses lan IPv4");
-	CHECK(apmon_fallback_after_failure(1, 0) == 1, "fallback: failed ULA send moves to IPv4");
-	CHECK(apmon_fallback_after_failure(0, 0) == 0, "fallback: failed IPv4 send goes back to the ULA");
-	CHECK(apmon_fallback_after_failure(1, 1) == 0, "fallback: portal failed ULA send stays on the ULA");
-	CHECK(apmon_fallback_after_failure(0, 1) == 0, "fallback: portal never moves to IPv4");
+	CHECK(apmon_fallback_after_failure(1, 1, 0) == 0, "fallback: one failed ULA send stays on the ULA");
+	CHECK(apmon_fallback_after_failure(1, 2, 0) == 1, "fallback: two failed ULA sends in a row move to IPv4");
+	CHECK(apmon_fallback_after_failure(0, 0, 0) == 0, "fallback: failed IPv4 send goes back to the ULA");
+	CHECK(apmon_fallback_after_failure(1, 2, 1) == 0, "fallback: portal failed ULA sends stay on the ULA");
+	CHECK(apmon_fallback_after_failure(0, 0, 1) == 0, "fallback: portal never moves to IPv4");
 }
 
 static void test_ifindex_action(void)
